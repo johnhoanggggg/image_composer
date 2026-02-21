@@ -29,10 +29,58 @@ from search_caltech_rembg import (
     get_subject_outline_neural,
     get_patch_variants,
     precompute_outlines,
-    match_outlines_cpu,
+    match_outlines as match_outlines_pyramid,
     create_composite,
     _top_k_indices,
 )
+
+
+# ============================================================
+# GROUND TRUTH: BRUTE-FORCE TEMPLATE MATCHING (all scales, full res)
+# ============================================================
+
+def match_outlines_bruteforce(patch_outline, target_outline,
+                               min_scale=0.3, max_scale=2.0, scale_steps=20):
+    """Exhaustive template matching at all scales at full resolution.
+    This is the slowest but most accurate — used as ground truth baseline."""
+    ph, pw = patch_outline.shape[:2]
+    th, tw = target_outline.shape[:2]
+    scales = np.linspace(min_scale, max_scale, scale_steps)
+
+    best_score = -1
+    best_result = (0, 0, 1.0, -1)
+
+    for scale in scales:
+        new_w, new_h = int(pw * scale), int(ph * scale)
+        if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
+            continue
+
+        patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
+        n_pixels = np.sum(patch_scaled > 0)
+        if n_pixels < 50:
+            continue
+
+        result = cv2.matchTemplate(target_outline, patch_scaled, cv2.TM_CCORR_NORMED)
+        result_flat = result.flatten()
+        top_indices = _top_k_indices(result_flat, 5)
+
+        for idx in top_indices:
+            y_idx = idx // result.shape[1]
+            x_idx = idx % result.shape[1]
+            score = result_flat[idx]
+
+            target_region = target_outline[y_idx:y_idx + new_h, x_idx:x_idx + new_w]
+            if target_region.shape != (new_h, new_w):
+                continue
+            target_pixels = np.sum(target_region > 0)
+            if target_pixels < n_pixels * 0.2:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_result = (x_idx, y_idx, scale, score)
+
+    return best_result
 
 
 # ============================================================
@@ -160,102 +208,11 @@ def match_outlines_hu_prefilter(patch_outline, target_outline,
 
     # Stage 2: Template matching with reduced scale steps (shapes are plausible)
     reduced_steps = max(5, scale_steps // 2)
-    return match_outlines_cpu(patch_outline, target_outline,
-                              min_scale, max_scale, reduced_steps)
+    return match_outlines_bruteforce(patch_outline, target_outline,
+                                     min_scale, max_scale, reduced_steps)
 
 
-# ============================================================
-# MATCHER 3: PYRAMID (DOWNSAMPLED) TEMPLATE MATCHING
-# ============================================================
-
-def match_outlines_pyramid(patch_outline, target_outline,
-                           min_scale=0.3, max_scale=2.0, scale_steps=20):
-    """Multi-resolution pyramid matching:
-    1. Downsample both outlines by 4x
-    2. Run template matching at low res to find best 3 scales
-    3. Refine only those 3 scales at full resolution
-
-    Theoretical speedup: ~16x for the coarse pass (1/4 size in both dimensions),
-    then only 3 full-res passes instead of 20.
-    """
-    ph, pw = patch_outline.shape[:2]
-    th, tw = target_outline.shape[:2]
-
-    # --- Level 1: Downsample by 4x ---
-    ds_factor = 4
-    target_small = cv2.resize(target_outline, (tw // ds_factor, th // ds_factor),
-                              interpolation=cv2.INTER_AREA)
-    patch_small = cv2.resize(patch_outline, (pw // ds_factor, ph // ds_factor),
-                             interpolation=cv2.INTER_AREA)
-    # Re-threshold after downsampling
-    _, target_small = cv2.threshold(target_small, 64, 255, cv2.THRESH_BINARY)
-    _, patch_small = cv2.threshold(patch_small, 64, 255, cv2.THRESH_BINARY)
-
-    ph_s, pw_s = patch_small.shape[:2]
-    th_s, tw_s = target_small.shape[:2]
-
-    scales = np.linspace(min_scale, max_scale, scale_steps)
-
-    # Coarse pass at low resolution
-    coarse_results = []
-    for scale in scales:
-        new_w_s = int(pw_s * scale)
-        new_h_s = int(ph_s * scale)
-
-        if new_w_s >= tw_s or new_h_s >= th_s or new_w_s < 8 or new_h_s < 8:
-            continue
-
-        ps = cv2.resize(patch_small, (new_w_s, new_h_s))
-        if np.sum(ps > 0) < 10:
-            continue
-
-        result = cv2.matchTemplate(target_small, ps, cv2.TM_CCORR_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-        coarse_results.append((scale, max_val, max_loc))
-
-    if not coarse_results:
-        return (0, 0, 1.0, -1)
-
-    # Pick top 3 scales from coarse pass
-    coarse_results.sort(key=lambda x: x[1], reverse=True)
-    top_scales = [r[0] for r in coarse_results[:3]]
-
-    # --- Level 2: Refine at full resolution ---
-    best_score = -1
-    best_result = (0, 0, 1.0, -1)
-
-    for scale in top_scales:
-        new_w, new_h = int(pw * scale), int(ph * scale)
-
-        if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
-            continue
-
-        patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
-        n_pixels = np.sum(patch_scaled > 0)
-        if n_pixels < 50:
-            continue
-
-        result = cv2.matchTemplate(target_outline, patch_scaled, cv2.TM_CCORR_NORMED)
-        result_flat = result.flatten()
-        top_indices = _top_k_indices(result_flat, 3)
-
-        for idx in top_indices:
-            y_idx = idx // result.shape[1]
-            x_idx = idx % result.shape[1]
-            score = result_flat[idx]
-
-            target_region = target_outline[y_idx:y_idx + new_h, x_idx:x_idx + new_w]
-            if target_region.shape != (new_h, new_w):
-                continue
-            target_pixels = np.sum(target_region > 0)
-            if target_pixels < n_pixels * 0.2:
-                continue
-
-            if score > best_score:
-                best_score = score
-                best_result = (x_idx, y_idx, scale, score)
-
-    return best_result
+# Matcher 3 (pyramid 4x) is imported from search_caltech_rembg as match_outlines_pyramid
 
 
 # ============================================================
@@ -342,10 +299,10 @@ def match_outlines_orb(patch_outline, target_outline,
 # ============================================================
 
 MATCHERS = {
-    "template (ground truth)": match_outlines_cpu,
+    "template (ground truth)": match_outlines_bruteforce,
+    "pyramid 4x":              match_outlines_pyramid,
     "chamfer distance":        match_outlines_chamfer,
     "hu prefilter + template": match_outlines_hu_prefilter,
-    "pyramid 4x":              match_outlines_pyramid,
     "orb features":            match_outlines_orb,
 }
 

@@ -2,10 +2,12 @@
 """
 Search Caltech101 dataset for best matching images to composite a patch onto.
 Uses neural network-based segmentation (rembg) for outline extraction.
-OPTIMIZED VERSION with GPU template matching and threading.
+OPTIMIZED VERSION with GPU template matching, threading, disk caching,
+coarse-to-fine scale search, and early termination.
 """
 
 import os
+import hashlib
 import tensorflow_datasets as tfds
 import matplotlib.pyplot as plt
 import cv2
@@ -36,6 +38,40 @@ except:
 _rembg_session = None
 _rembg_lock = threading.Lock()
 
+# ============================================================
+# DISK CACHE FOR SEGMENTATION MASKS
+# ============================================================
+_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "image_composer_masks")
+
+
+def _get_image_hash(img):
+    """Fast hash of an image array for cache keying."""
+    return hashlib.md5(img.tobytes()[:4096]).hexdigest()
+
+
+def _get_cached_mask(img, max_resolution):
+    """Load a cached mask from disk if it exists."""
+    cache_key = f"{_get_image_hash(img)}_{max_resolution}"
+    cache_path = os.path.join(_CACHE_DIR, f"{cache_key}.npz")
+    if os.path.exists(cache_path):
+        try:
+            data = np.load(cache_path)
+            return data["mask"]
+        except Exception:
+            return None
+    return None
+
+
+def _save_cached_mask(img, max_resolution, mask):
+    """Save a mask to disk cache."""
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    cache_key = f"{_get_image_hash(img)}_{max_resolution}"
+    cache_path = os.path.join(_CACHE_DIR, f"{cache_key}.npz")
+    try:
+        np.savez_compressed(cache_path, mask=mask)
+    except Exception:
+        pass
+
 
 def get_rembg_session(model_name="isnet-general-use"):
     """Get or create rembg session (thread-safe)."""
@@ -51,18 +87,18 @@ def get_rembg_session(model_name="isnet-general-use"):
 def get_mask_from_image(img, session):
     """Get segmentation mask for a single image."""
     pil_img = Image.fromarray(img)
-    
+
     with _rembg_lock:  # rembg may not be thread-safe
         result = remove(pil_img, session=session, only_mask=True)
-    
+
     if isinstance(result, Image.Image):
         mask = np.array(result)
     else:
         mask = result
-    
+
     if len(mask.shape) == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
-    
+
     return mask
 
 
@@ -204,109 +240,143 @@ def get_gpu_matcher():
     return _thread_local.matcher
 
 
+def _top_k_indices(arr, k):
+    """O(n) top-k selection using argpartition instead of O(n log n) argsort."""
+    if len(arr) <= k:
+        return np.argsort(arr)[::-1]
+    indices = np.argpartition(arr, -k)[-k:]
+    # Sort just the top k
+    return indices[np.argsort(arr[indices])[::-1]]
+
+
+def _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw,
+                    matcher_fn, top_k=3):
+    """Run template matching at a single scale. Returns (x, y, scale, score) or None."""
+    new_w, new_h = int(pw * scale), int(ph * scale)
+
+    if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
+        return None
+
+    patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
+    patch_scaled_pixels = np.sum(patch_scaled > 0)
+
+    if patch_scaled_pixels < 50:
+        return None
+
+    result = matcher_fn(target_outline, patch_scaled)
+
+    result_flat = result.flatten()
+    top_indices = _top_k_indices(result_flat, top_k)
+
+    best_score = -1
+    best_result = None
+
+    for idx in top_indices:
+        y_idx, x_idx = idx // result.shape[1], idx % result.shape[1]
+        score = result_flat[idx]
+
+        target_region = target_outline[y_idx:y_idx+new_h, x_idx:x_idx+new_w]
+        if target_region.shape != (new_h, new_w):
+            continue
+
+        target_pixels = np.sum(target_region > 0)
+        if target_pixels < patch_scaled_pixels * 0.2:
+            continue
+
+        if score > best_score:
+            best_score = score
+            best_result = (x_idx, y_idx, scale, score)
+
+    return best_result
+
+
 def match_outlines_gpu(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, scale_steps=20):
-    """Match patch outline to target outline using GPU-accelerated template matching."""
+    """Match patch outline to target outline using GPU-accelerated template matching.
+    Uses coarse-to-fine: first sweep with fewer scales, then refine around the best."""
     ph, pw = patch_outline.shape[:2]
     th, tw = target_outline.shape[:2]
-    
-    scales = np.linspace(min_scale, max_scale, scale_steps)
-    
-    best_score = -1
-    best_result = (0, 0, 1.0, -1)
-    
+
     # Upload target to GPU once
     target_gpu = cv2.cuda_GpuMat()
     target_gpu.upload(target_outline)
-    
     matcher = get_gpu_matcher()
-    
     patch_gpu = cv2.cuda_GpuMat()
-    
-    for scale in scales:
-        new_w, new_h = int(pw * scale), int(ph * scale)
-        
-        if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
-            continue
-        
-        patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
-        patch_scaled_pixels = np.sum(patch_scaled > 0)
-        
-        if patch_scaled_pixels < 50:
-            continue
-        
-        # Upload scaled patch to GPU
+
+    def gpu_match(target, patch_scaled):
         patch_gpu.upload(patch_scaled)
-        
-        # GPU template matching
         result_gpu = matcher.match(target_gpu, patch_gpu)
-        result = result_gpu.download()
-        
-        # Find best matches
-        result_flat = result.flatten()
-        top_indices = np.argsort(result_flat)[-5:]
-        
-        for idx in top_indices:
-            y_idx, x_idx = idx // result.shape[1], idx % result.shape[1]
-            score = result_flat[idx]
-            
-            target_region = target_outline[y_idx:y_idx+new_h, x_idx:x_idx+new_w]
-            if target_region.shape != (new_h, new_w):
-                continue
-            
-            target_pixels = np.sum(target_region > 0)
-            if target_pixels < patch_scaled_pixels * 0.2:
-                continue
-            
-            if score > best_score:
-                best_score = score
-                best_result = (x_idx, y_idx, scale, score)
-    
+        return result_gpu.download()
+
+    # --- Coarse pass: ~40% of original scale steps ---
+    coarse_steps = max(5, scale_steps // 2)
+    coarse_scales = np.linspace(min_scale, max_scale, coarse_steps)
+
+    best_score = -1
+    best_result = (0, 0, 1.0, -1)
+    best_scale = None
+
+    for scale in coarse_scales:
+        r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, gpu_match, top_k=3)
+        if r and r[3] > best_score:
+            best_score = r[3]
+            best_result = r
+            best_scale = scale
+
+    # --- Fine pass: refine around best coarse scale ---
+    if best_scale is not None:
+        step_size = (max_scale - min_scale) / max(coarse_steps - 1, 1)
+        fine_min = max(min_scale, best_scale - step_size)
+        fine_max = min(max_scale, best_scale + step_size)
+        fine_steps = max(4, scale_steps - coarse_steps)
+        fine_scales = np.linspace(fine_min, fine_max, fine_steps)
+
+        for scale in fine_scales:
+            r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, gpu_match, top_k=3)
+            if r and r[3] > best_score:
+                best_score = r[3]
+                best_result = r
+
     return best_result
 
 
 def match_outlines_cpu(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, scale_steps=20):
-    """Match patch outline to target outline using CPU."""
+    """Match patch outline to target outline using CPU.
+    Uses coarse-to-fine: first sweep with fewer scales, then refine around the best."""
     ph, pw = patch_outline.shape[:2]
     th, tw = target_outline.shape[:2]
-    
-    scales = np.linspace(min_scale, max_scale, scale_steps)
-    
+
+    def cpu_match(target, patch_scaled):
+        return cv2.matchTemplate(target, patch_scaled, cv2.TM_CCORR_NORMED)
+
+    # --- Coarse pass ---
+    coarse_steps = max(5, scale_steps // 2)
+    coarse_scales = np.linspace(min_scale, max_scale, coarse_steps)
+
     best_score = -1
     best_result = (0, 0, 1.0, -1)
-    
-    for scale in scales:
-        new_w, new_h = int(pw * scale), int(ph * scale)
-        
-        if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
-            continue
-        
-        patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
-        patch_scaled_pixels = np.sum(patch_scaled > 0)
-        
-        if patch_scaled_pixels < 50:
-            continue
-        
-        result = cv2.matchTemplate(target_outline, patch_scaled, cv2.TM_CCORR_NORMED)
-        
-        result_flat = result.flatten()
-        top_indices = np.argsort(result_flat)[-5:]
-        
-        for idx in top_indices:
-            y_idx, x_idx = idx // result.shape[1], idx % result.shape[1]
-            score = result_flat[idx]
-            
-            target_region = target_outline[y_idx:y_idx+new_h, x_idx:x_idx+new_w]
-            if target_region.shape != (new_h, new_w):
-                continue
-            
-            target_pixels = np.sum(target_region > 0)
-            if target_pixels < patch_scaled_pixels * 0.2:
-                continue
-            
-            if score > best_score:
-                best_score = score
-                best_result = (x_idx, y_idx, scale, score)
-    
+    best_scale = None
+
+    for scale in coarse_scales:
+        r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, cpu_match, top_k=3)
+        if r and r[3] > best_score:
+            best_score = r[3]
+            best_result = r
+            best_scale = scale
+
+    # --- Fine pass ---
+    if best_scale is not None:
+        step_size = (max_scale - min_scale) / max(coarse_steps - 1, 1)
+        fine_min = max(min_scale, best_scale - step_size)
+        fine_max = min(max_scale, best_scale + step_size)
+        fine_steps = max(4, scale_steps - coarse_steps)
+        fine_scales = np.linspace(fine_min, fine_max, fine_steps)
+
+        for scale in fine_scales:
+            r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, cpu_match, top_k=3)
+            if r and r[3] > best_score:
+                best_score = r[3]
+                best_result = r
+
     return best_result
 
 
@@ -379,20 +449,37 @@ def create_composite(patch, target, x, y, scale, blend_mode='soft', alpha=0.9, p
 # ============================================================
 
 def precompute_single_outline(args):
-    """Process a single image for outline extraction."""
+    """Process a single image for outline extraction.
+    Uses disk cache to skip rembg inference for previously seen images."""
     example, info, max_resolution = args
-    
+
     image = example["image"].numpy()
     label = example["label"].numpy()
     class_name = info.features["label"].int2str(label)
-    
+
     image_proc, img_scale = resize_to_max(image, max_resolution)
-    
+
+    # Try disk cache first
+    cached_mask = _get_cached_mask(image_proc, max_resolution)
+    if cached_mask is not None:
+        h, w = image_proc.shape[:2]
+        outline = mask_to_outline(cached_mask, h, w)
+        return {
+            'image': image,
+            'outline': outline,
+            'img_scale': img_scale,
+            'class_name': class_name
+        }
+
+    # Cache miss — run rembg
     session = get_rembg_session()
     mask = get_mask_from_image(image_proc, session)
     h, w = image_proc.shape[:2]
     outline = mask_to_outline(mask, h, w)
-    
+
+    # Save to disk cache for next run
+    _save_cached_mask(image_proc, max_resolution, mask)
+
     return {
         'image': image,
         'outline': outline,
@@ -402,47 +489,51 @@ def precompute_single_outline(args):
 
 
 def precompute_outlines(samples, info, max_resolution, num_threads=1):
-    """Precompute all outlines - neural net is the bottleneck so limited threading helps."""
+    """Precompute all outlines with disk caching.
+    Cached masks skip the neural net entirely, so subsequent runs are much faster."""
     print(f"Precomputing segmentation masks for {len(samples)} images...")
-    
-    # Neural net inference is mostly single-threaded due to GPU lock
-    # But we can still benefit from overlapping CPU work
+
+    # Pre-load the model once before any threads start
+    get_rembg_session()
+
     processed = []
-    
+
     if num_threads <= 1:
-        # Single-threaded (safest for GPU inference)
-        session = get_rembg_session()  # Pre-load model
         for example in tqdm(samples):
             result = precompute_single_outline((example, info, max_resolution))
             processed.append(result)
     else:
-        # Limited threading - helps overlap CPU preprocessing with GPU inference
         args_list = [(ex, info, max_resolution) for ex in samples]
-        
+
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = [executor.submit(precompute_single_outline, args) for args in args_list]
             for future in tqdm(as_completed(futures), total=len(futures)):
                 processed.append(future.result())
-    
+
     return processed
 
 
 def match_single_image(args):
-    """Match a single image against all patch variants."""
-    data, variants, min_scale, max_scale, scale_steps, patch_scale = args
-    
+    """Match a single image against all patch variants.
+    Includes early termination: if a near-perfect match is found, skip remaining variants."""
+    data, variants, min_scale, max_scale, scale_steps, patch_scale, early_stop_threshold = args
+
     target_outline = data['outline']
     img_scale = data['img_scale']
-    
+
+    # Skip images with empty outlines
+    if np.sum(target_outline > 0) < 50:
+        return None
+
     best_var_score = -1
     best_var_result = None
-    
+
     for patch_var, outline_var, transform in variants:
         x, y, match_scale, score = match_outlines(
             outline_var, target_outline,
             min_scale=min_scale, max_scale=max_scale, scale_steps=scale_steps
         )
-        
+
         if score > best_var_score:
             best_var_score = score
             best_var_result = {
@@ -454,20 +545,25 @@ def match_single_image(args):
                 'score': score,
                 'transform': transform
             }
-    
+
+            # Early termination: very high score means we won't do much better
+            if best_var_score >= early_stop_threshold:
+                break
+
     return best_var_result
 
 
-def match_all_images(processed_images, variants, min_scale, max_scale, scale_steps, patch_scale, num_threads=4):
-    """Match outlines with threading (CPU or GPU, both benefit from threading)."""
+def match_all_images(processed_images, variants, min_scale, max_scale, scale_steps,
+                     patch_scale, num_threads=4, early_stop_threshold=0.95):
+    """Match outlines with threading. Includes early-stop threshold per image."""
     print(f"Matching {len(processed_images)} images against {len(variants)} variants using {num_threads} threads...")
-    
+
     results = []
     args_list = [
-        (data, variants, min_scale, max_scale, scale_steps, patch_scale)
+        (data, variants, min_scale, max_scale, scale_steps, patch_scale, early_stop_threshold)
         for data in processed_images
     ]
-    
+
     if num_threads <= 1:
         for args in tqdm(args_list):
             result = match_single_image(args)
@@ -480,7 +576,7 @@ def match_all_images(processed_images, variants, min_scale, max_scale, scale_ste
                 result = future.result()
                 if result:
                     results.append(result)
-    
+
     return results
 
 
@@ -491,51 +587,53 @@ def match_all_images(processed_images, variants, min_scale, max_scale, scale_ste
 def search_dataset(patch_path, num_samples=200, top_k=5,
                    min_scale=0.3, max_scale=2.0, scale_steps=20,
                    allow_flip=True, allow_rotation=False, rotation_steps=4,
-                   max_resolution=320, num_threads_segmentation=1, num_threads_matching=4):
+                   max_resolution=320, num_threads_segmentation=1, num_threads_matching=4,
+                   early_stop_threshold=0.95):
     """Search Caltech101 for images that best match the patch outline.
-    
+
     Args:
         num_threads_segmentation: Threads for neural net (keep low, 1-2)
         num_threads_matching: Threads for template matching (can be higher, 4-8)
+        early_stop_threshold: Skip remaining variants if a match score exceeds this (0-1)
     """
-    
+
     # Load patch
     patch = cv2.imread(patch_path)
     if patch is None:
         raise ValueError(f"Could not load patch: {patch_path}")
     patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
-    
+
     patch_proc, patch_scale = resize_to_max(patch_rgb, max_resolution)
-    
+
     print("Extracting patch outline...")
     patch_outline = get_subject_outline_neural(patch_proc)
-    
+
     variants = get_patch_variants(patch_proc, patch_outline, allow_flip, allow_rotation, rotation_steps)
     print(f"Testing {len(variants)} patch variants")
-    
+
     # Load dataset
     print("Loading Caltech101 dataset...")
     ds, info = tfds.load("caltech101", split="train", with_info=True, shuffle_files=True)
     ds_list = list(ds)
-    
+
     if num_samples < len(ds_list):
         import random
         samples = random.sample(ds_list, num_samples)
     else:
         samples = ds_list
-    
-    # Phase 1: Precompute segmentation masks (GPU-bound, limited threading)
+
+    # Phase 1: Precompute segmentation masks (with disk caching)
     processed = precompute_outlines(samples, info, max_resolution, num_threads_segmentation)
-    
+
     # Phase 2: Match outlines (CPU/GPU template matching, benefits from threading)
     results = match_all_images(
-        processed, variants, min_scale, max_scale, scale_steps, patch_scale, 
-        num_threads_matching
+        processed, variants, min_scale, max_scale, scale_steps, patch_scale,
+        num_threads_matching, early_stop_threshold
     )
-    
+
     # Sort and return top results
     results.sort(key=lambda r: r['score'], reverse=True)
-    
+
     return results[:top_k], patch_rgb, patch_outline
 
 

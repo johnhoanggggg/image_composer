@@ -395,7 +395,7 @@ def run_benchmark(patch_path, num_samples=100, min_scale=0.3, max_scale=2.0,
     processed = [p for p in processed if np.sum(p['outline'] > 0) >= 50]
     print(f"Benchmarking {len(processed)} images with valid outlines\n")
 
-    # Run benchmark
+    # Run benchmark — store image data alongside matcher results
     all_results = []
     for data in tqdm(processed, desc="Benchmarking"):
         pair_results = benchmark_pair(
@@ -403,9 +403,11 @@ def run_benchmark(patch_path, num_samples=100, min_scale=0.3, max_scale=2.0,
             min_scale, max_scale, scale_steps
         )
         pair_results["_class"] = data['class_name']
+        pair_results["_image"] = data['image']
+        pair_results["_outline"] = data['outline']
         all_results.append(pair_results)
 
-    return all_results, patch_rgb, patch_outline
+    return all_results, patch_rgb, patch_outline, patch_proc
 
 
 def compute_metrics(all_results):
@@ -478,6 +480,89 @@ def print_metrics(metrics):
     print(f"{'template (ground truth)':<28} {'1.0x':>8} {gt_time:>7.1f} "
           f"{'0.0':>10} {'0.000':>9} {'1.000':>8}")
     print()
+
+
+def visualize_matches(all_results, patch, patch_outline, patch_proc,
+                      num_images=6, output_path="matcher_visual_comparison.png"):
+    """Show side-by-side composites: each row = one target image, each column = one matcher.
+
+    This lets you visually compare where each matcher places the patch on the
+    same target image, with template matching as ground truth in the first column.
+    """
+    matcher_names = list(MATCHERS.keys())
+    n_matchers = len(matcher_names)
+
+    # Pick the top images by ground truth score so we see interesting matches
+    gt_name = "template (ground truth)"
+    scored = [(i, r[gt_name]["score"]) for i, r in enumerate(all_results)
+              if r[gt_name]["score"] > 0]
+    scored.sort(key=lambda x: -x[1])
+    picked = [all_results[i] for i, _ in scored[:num_images]]
+
+    fig, axes = plt.subplots(num_images, n_matchers + 1, figsize=(4 * (n_matchers + 1), 4 * num_images))
+    if num_images == 1:
+        axes = axes[np.newaxis, :]
+
+    # Column 0 header: original target
+    axes[0, 0].set_title("Target image", fontsize=10, fontweight='bold')
+
+    # Matcher column headers
+    for col, name in enumerate(matcher_names):
+        label = name if name != gt_name else "TEMPLATE (GT)"
+        axes[0, col + 1].set_title(label, fontsize=9, fontweight='bold')
+
+    for row, pair in enumerate(picked):
+        target_image = pair["_image"]
+        target_outline = pair["_outline"]
+        class_name = pair["_class"]
+
+        # Column 0: raw target image + outline overlay
+        axes[row, 0].imshow(target_image)
+        # Overlay outline in green
+        outline_rgb = np.zeros_like(target_image)
+        if target_outline.shape[:2] != target_image.shape[:2]:
+            outline_disp = cv2.resize(target_outline, (target_image.shape[1], target_image.shape[0]))
+        else:
+            outline_disp = target_outline
+        outline_rgb[outline_disp > 0] = [0, 255, 0]
+        axes[row, 0].imshow(outline_rgb, alpha=0.35)
+        axes[row, 0].set_ylabel(class_name, fontsize=9)
+        axes[row, 0].set_xticks([])
+        axes[row, 0].set_yticks([])
+
+        # Columns 1..N: composite from each matcher
+        for col, name in enumerate(matcher_names):
+            r = pair[name]
+            x, y, scale, score = r["x"], r["y"], r["scale"], r["score"]
+
+            if score > 0 and scale > 0:
+                composite = create_composite(patch, target_image, x, y, scale,
+                                             blend_mode='alpha', alpha=0.85)
+            else:
+                composite = target_image.copy()
+
+            axes[row, col + 1].imshow(composite)
+            time_ms = r["time_ms"]
+            axes[row, col + 1].set_xlabel(
+                f"score={score:.3f}  scale={scale:.2f}\n"
+                f"pos=({x},{y})  {time_ms:.0f}ms",
+                fontsize=7)
+            axes[row, col + 1].set_xticks([])
+            axes[row, col + 1].set_yticks([])
+
+            # Highlight ground truth column with a border
+            if name == gt_name:
+                for spine in axes[row, col + 1].spines.values():
+                    spine.set_edgecolor('#2196F3')
+                    spine.set_linewidth(3)
+
+    plt.suptitle("Visual Comparison: Patch Placement by Each Matcher\n"
+                 "(Blue border = template matching ground truth)",
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved visual comparison: {output_path}")
+    plt.show()
 
 
 def plot_comparison(all_results, metrics, output_path="benchmark_results.png"):
@@ -565,7 +650,7 @@ if __name__ == "__main__":
     print(f"  Scales: {MIN_SCALE}-{MAX_SCALE} ({SCALE_STEPS} steps)")
     print()
 
-    all_results, patch, patch_outline = run_benchmark(
+    all_results, patch, patch_outline, patch_proc = run_benchmark(
         PATCH_PATH,
         num_samples=NUM_SAMPLES,
         min_scale=MIN_SCALE,
@@ -577,3 +662,4 @@ if __name__ == "__main__":
     metrics = compute_metrics(all_results)
     print_metrics(metrics)
     plot_comparison(all_results, metrics)
+    visualize_matches(all_results, patch, patch_outline, patch_proc, num_images=6)

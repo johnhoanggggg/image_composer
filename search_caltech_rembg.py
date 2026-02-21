@@ -226,7 +226,7 @@ def get_patch_variants(patch, outline, allow_flip=True, allow_rotation=False, ro
 
 
 # ============================================================
-# GPU-ACCELERATED TEMPLATE MATCHING
+# PYRAMID 4x TEMPLATE MATCHING
 # ============================================================
 
 # Thread-local storage for GPU mats (each thread gets its own)
@@ -249,143 +249,98 @@ def _top_k_indices(arr, k):
     return indices[np.argsort(arr[indices])[::-1]]
 
 
-def _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw,
-                    matcher_fn, top_k=3):
-    """Run template matching at a single scale. Returns (x, y, scale, score) or None."""
-    new_w, new_h = int(pw * scale), int(ph * scale)
-
-    if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
-        return None
-
-    patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
-    patch_scaled_pixels = np.sum(patch_scaled > 0)
-
-    if patch_scaled_pixels < 50:
-        return None
-
-    result = matcher_fn(target_outline, patch_scaled)
-
-    result_flat = result.flatten()
-    top_indices = _top_k_indices(result_flat, top_k)
-
-    best_score = -1
-    best_result = None
-
-    for idx in top_indices:
-        y_idx, x_idx = idx // result.shape[1], idx % result.shape[1]
-        score = result_flat[idx]
-
-        target_region = target_outline[y_idx:y_idx+new_h, x_idx:x_idx+new_w]
-        if target_region.shape != (new_h, new_w):
-            continue
-
-        target_pixels = np.sum(target_region > 0)
-        if target_pixels < patch_scaled_pixels * 0.2:
-            continue
-
-        if score > best_score:
-            best_score = score
-            best_result = (x_idx, y_idx, scale, score)
-
-    return best_result
-
-
-def match_outlines_gpu(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, scale_steps=20):
-    """Match patch outline to target outline using GPU-accelerated template matching.
-    Uses coarse-to-fine: first sweep with fewer scales, then refine around the best."""
-    ph, pw = patch_outline.shape[:2]
-    th, tw = target_outline.shape[:2]
-
-    # Upload target to GPU once
-    target_gpu = cv2.cuda_GpuMat()
-    target_gpu.upload(target_outline)
-    matcher = get_gpu_matcher()
-    patch_gpu = cv2.cuda_GpuMat()
-
-    def gpu_match(target, patch_scaled):
-        patch_gpu.upload(patch_scaled)
-        result_gpu = matcher.match(target_gpu, patch_gpu)
-        return result_gpu.download()
-
-    # --- Coarse pass: ~40% of original scale steps ---
-    coarse_steps = max(5, scale_steps // 2)
-    coarse_scales = np.linspace(min_scale, max_scale, coarse_steps)
-
+def _refine_at_full_res(patch_outline, target_outline, scales, ph, pw, th, tw, top_k=3):
+    """Run full-resolution template matching at specific scales and return the best result."""
     best_score = -1
     best_result = (0, 0, 1.0, -1)
-    best_scale = None
 
-    for scale in coarse_scales:
-        r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, gpu_match, top_k=3)
-        if r and r[3] > best_score:
-            best_score = r[3]
-            best_result = r
-            best_scale = scale
+    for scale in scales:
+        new_w, new_h = int(pw * scale), int(ph * scale)
 
-    # --- Fine pass: refine around best coarse scale ---
-    if best_scale is not None:
-        step_size = (max_scale - min_scale) / max(coarse_steps - 1, 1)
-        fine_min = max(min_scale, best_scale - step_size)
-        fine_max = min(max_scale, best_scale + step_size)
-        fine_steps = max(4, scale_steps - coarse_steps)
-        fine_scales = np.linspace(fine_min, fine_max, fine_steps)
+        if new_w >= tw or new_h >= th or new_w < 30 or new_h < 30:
+            continue
 
-        for scale in fine_scales:
-            r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, gpu_match, top_k=3)
-            if r and r[3] > best_score:
-                best_score = r[3]
-                best_result = r
+        patch_scaled = cv2.resize(patch_outline, (new_w, new_h))
+        n_pixels = np.sum(patch_scaled > 0)
+        if n_pixels < 50:
+            continue
 
-    return best_result
+        result = cv2.matchTemplate(target_outline, patch_scaled, cv2.TM_CCORR_NORMED)
+        result_flat = result.flatten()
+        top_indices = _top_k_indices(result_flat, top_k)
 
+        for idx in top_indices:
+            y_idx = idx // result.shape[1]
+            x_idx = idx % result.shape[1]
+            score = result_flat[idx]
 
-def match_outlines_cpu(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, scale_steps=20):
-    """Match patch outline to target outline using CPU.
-    Uses coarse-to-fine: first sweep with fewer scales, then refine around the best."""
-    ph, pw = patch_outline.shape[:2]
-    th, tw = target_outline.shape[:2]
+            target_region = target_outline[y_idx:y_idx + new_h, x_idx:x_idx + new_w]
+            if target_region.shape != (new_h, new_w):
+                continue
+            target_pixels = np.sum(target_region > 0)
+            if target_pixels < n_pixels * 0.2:
+                continue
 
-    def cpu_match(target, patch_scaled):
-        return cv2.matchTemplate(target, patch_scaled, cv2.TM_CCORR_NORMED)
-
-    # --- Coarse pass ---
-    coarse_steps = max(5, scale_steps // 2)
-    coarse_scales = np.linspace(min_scale, max_scale, coarse_steps)
-
-    best_score = -1
-    best_result = (0, 0, 1.0, -1)
-    best_scale = None
-
-    for scale in coarse_scales:
-        r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, cpu_match, top_k=3)
-        if r and r[3] > best_score:
-            best_score = r[3]
-            best_result = r
-            best_scale = scale
-
-    # --- Fine pass ---
-    if best_scale is not None:
-        step_size = (max_scale - min_scale) / max(coarse_steps - 1, 1)
-        fine_min = max(min_scale, best_scale - step_size)
-        fine_max = min(max_scale, best_scale + step_size)
-        fine_steps = max(4, scale_steps - coarse_steps)
-        fine_scales = np.linspace(fine_min, fine_max, fine_steps)
-
-        for scale in fine_scales:
-            r = _match_at_scale(patch_outline, target_outline, scale, ph, pw, th, tw, cpu_match, top_k=3)
-            if r and r[3] > best_score:
-                best_score = r[3]
-                best_result = r
+            if score > best_score:
+                best_score = score
+                best_result = (x_idx, y_idx, scale, score)
 
     return best_result
 
 
 def match_outlines(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, scale_steps=20):
-    """Match outlines - uses GPU if available, otherwise CPU."""
-    if CUDA_AVAILABLE:
-        return match_outlines_gpu(patch_outline, target_outline, min_scale, max_scale, scale_steps)
-    else:
-        return match_outlines_cpu(patch_outline, target_outline, min_scale, max_scale, scale_steps)
+    """Pyramid 4x matching: coarse pass at 1/4 resolution, refine top scales at full res.
+
+    1. Downsample both outlines by 4x
+    2. Run template matching at all scales on the small images (very fast)
+    3. Pick the top 3 scales
+    4. Refine only those 3 scales at full resolution
+    """
+    ph, pw = patch_outline.shape[:2]
+    th, tw = target_outline.shape[:2]
+
+    # --- Level 1: Downsample by 4x ---
+    ds = 4
+    target_small = cv2.resize(target_outline, (tw // ds, th // ds),
+                              interpolation=cv2.INTER_AREA)
+    patch_small = cv2.resize(patch_outline, (pw // ds, ph // ds),
+                             interpolation=cv2.INTER_AREA)
+    # Re-threshold after downsampling to keep binary
+    _, target_small = cv2.threshold(target_small, 64, 255, cv2.THRESH_BINARY)
+    _, patch_small = cv2.threshold(patch_small, 64, 255, cv2.THRESH_BINARY)
+
+    ph_s, pw_s = patch_small.shape[:2]
+    th_s, tw_s = target_small.shape[:2]
+
+    scales = np.linspace(min_scale, max_scale, scale_steps)
+
+    # Coarse pass at low resolution — sweep all scales cheaply
+    coarse_results = []
+    for scale in scales:
+        new_w_s = int(pw_s * scale)
+        new_h_s = int(ph_s * scale)
+
+        if new_w_s >= tw_s or new_h_s >= th_s or new_w_s < 8 or new_h_s < 8:
+            continue
+
+        ps = cv2.resize(patch_small, (new_w_s, new_h_s))
+        if np.sum(ps > 0) < 10:
+            continue
+
+        result = cv2.matchTemplate(target_small, ps, cv2.TM_CCORR_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(result)
+        coarse_results.append((scale, max_val))
+
+    if not coarse_results:
+        return (0, 0, 1.0, -1)
+
+    # Pick top 3 scales from coarse pass
+    coarse_results.sort(key=lambda x: x[1], reverse=True)
+    top_scales = [r[0] for r in coarse_results[:3]]
+
+    # --- Level 2: Refine at full resolution with only the best scales ---
+    return _refine_at_full_res(patch_outline, target_outline, top_scales,
+                               ph, pw, th, tw, top_k=3)
 
 
 # ============================================================
@@ -584,6 +539,22 @@ def match_all_images(processed_images, variants, min_scale, max_scale, scale_ste
 # MAIN SEARCH FUNCTION
 # ============================================================
 
+def _get_patch_fg_mask(img):
+    """Get the foreground segmentation mask for a patch image using rembg.
+    Returns a float32 mask in [0, 1] where 1 = foreground."""
+    if not REMBG_AVAILABLE:
+        # Fallback: treat non-black pixels as foreground
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if len(img.shape) == 3 else img
+        return (gray > 10).astype(np.float32)
+
+    session = get_rembg_session()
+    mask = get_mask_from_image(img, session)
+    # Smooth edges for clean compositing
+    mask_f = mask.astype(np.float32) / 255.0
+    mask_f = cv2.GaussianBlur(mask_f, (5, 5), 0)
+    return mask_f
+
+
 def search_dataset(patch_path, num_samples=200, top_k=5,
                    min_scale=0.3, max_scale=2.0, scale_steps=20,
                    allow_flip=True, allow_rotation=False, rotation_steps=4,
@@ -608,6 +579,10 @@ def search_dataset(patch_path, num_samples=200, top_k=5,
     print("Extracting patch outline...")
     patch_outline = get_subject_outline_neural(patch_proc)
 
+    # Extract foreground mask for background-free compositing
+    print("Extracting patch foreground mask...")
+    patch_fg_mask = _get_patch_fg_mask(patch_rgb)
+
     variants = get_patch_variants(patch_proc, patch_outline, allow_flip, allow_rotation, rotation_steps)
     print(f"Testing {len(variants)} patch variants")
 
@@ -625,7 +600,7 @@ def search_dataset(patch_path, num_samples=200, top_k=5,
     # Phase 1: Precompute segmentation masks (with disk caching)
     processed = precompute_outlines(samples, info, max_resolution, num_threads_segmentation)
 
-    # Phase 2: Match outlines (CPU/GPU template matching, benefits from threading)
+    # Phase 2: Match outlines (pyramid 4x matching, benefits from threading)
     results = match_all_images(
         processed, variants, min_scale, max_scale, scale_steps, patch_scale,
         num_threads_matching, early_stop_threshold
@@ -634,77 +609,95 @@ def search_dataset(patch_path, num_samples=200, top_k=5,
     # Sort and return top results
     results.sort(key=lambda r: r['score'], reverse=True)
 
-    return results[:top_k], patch_rgb, patch_outline
+    return results[:top_k], patch_rgb, patch_outline, patch_fg_mask
 
 
 # ============================================================
 # VISUALIZATION
 # ============================================================
 
-def visualize_results(patch, patch_outline, results, blend_mode='soft', alpha=0.9, output_path="search_results.png"):
-    """Visualize top matches."""
+def _apply_transform(img, transform):
+    """Apply flip/rotation transform string to an image or mask."""
+    result = img.copy()
+    if 'flip_h' in transform:
+        result = cv2.flip(result, 1)
+    if 'flip_v' in transform:
+        result = cv2.flip(result, 0)
+
+    if 'rot' in transform:
+        rot_part = transform.split('_')[0] if '_' in transform else transform
+        if rot_part == 'rot90':
+            result = cv2.rotate(result, cv2.ROTATE_90_CLOCKWISE)
+        elif rot_part == 'rot180':
+            result = cv2.rotate(result, cv2.ROTATE_180)
+        elif rot_part == 'rot270':
+            result = cv2.rotate(result, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif rot_part.startswith('rot'):
+            angle = int(rot_part[3:])
+            h, w = result.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            cos, sin = np.abs(M[0, 0]), np.abs(M[0, 1])
+            new_w, new_h = int(h * sin + w * cos), int(h * cos + w * sin)
+            M[0, 2] += (new_w - w) / 2
+            M[1, 2] += (new_h - h) / 2
+            result = cv2.warpAffine(result, M, (new_w, new_h))
+
+    return result
+
+
+def visualize_results(patch, patch_outline, results, patch_fg_mask=None,
+                      blend_mode='soft', alpha=0.9, output_path="search_results.png"):
+    """Visualize top matches. Uses patch_fg_mask to remove patch background."""
     n = len(results)
     fig, axes = plt.subplots(3, n + 1, figsize=(4 * (n + 1), 12))
-    
+
     axes[0, 0].imshow(patch)
     axes[0, 0].set_title("Patch")
     axes[0, 0].axis("off")
-    
+
     axes[1, 0].imshow(patch_outline, cmap='gray')
     axes[1, 0].set_title("Patch Outline")
     axes[1, 0].axis("off")
-    
+
+    # Show the foreground mask
+    if patch_fg_mask is not None:
+        axes[2, 0].imshow(patch_fg_mask, cmap='gray')
+        axes[2, 0].set_title("FG Mask")
     axes[2, 0].axis("off")
-    
+
     for i, result in enumerate(results):
         image = result['image']
         x, y, scale, score = result['x'], result['y'], result['scale'], result['score']
         class_name = result['class_name']
         transform = result['transform']
-        
-        # Apply transform to patch
-        patch_transformed = patch.copy()
-        if 'flip_h' in transform:
-            patch_transformed = cv2.flip(patch_transformed, 1)
-        if 'flip_v' in transform:
-            patch_transformed = cv2.flip(patch_transformed, 0)
-        
-        if 'rot' in transform:
-            rot_part = transform.split('_')[0] if '_' in transform else transform
-            if rot_part == 'rot90':
-                patch_transformed = cv2.rotate(patch_transformed, cv2.ROTATE_90_CLOCKWISE)
-            elif rot_part == 'rot180':
-                patch_transformed = cv2.rotate(patch_transformed, cv2.ROTATE_180)
-            elif rot_part == 'rot270':
-                patch_transformed = cv2.rotate(patch_transformed, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            elif rot_part.startswith('rot'):
-                angle = int(rot_part[3:])
-                h, w = patch_transformed.shape[:2]
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                cos, sin = np.abs(M[0, 0]), np.abs(M[0, 1])
-                new_w, new_h = int(h * sin + w * cos), int(h * cos + w * sin)
-                M[0, 2] += (new_w - w) / 2
-                M[1, 2] += (new_h - h) / 2
-                patch_transformed = cv2.warpAffine(patch_transformed, M, (new_w, new_h))
-        
+
+        # Apply same transform to both patch and its mask
+        patch_transformed = _apply_transform(patch, transform)
+        mask_transformed = _apply_transform(patch_fg_mask, transform) if patch_fg_mask is not None else None
+
         outline = get_subject_outline_neural(image)
-        
-        image_vis = create_composite(patch_transformed, image, x, y, scale, blend_mode, alpha)
+
+        # Row 1: composite with background removed
+        image_vis = create_composite(patch_transformed, image, x, y, scale,
+                                     blend_mode, alpha, patch_mask=mask_transformed)
         axes[0, i + 1].imshow(image_vis)
         axes[0, i + 1].set_title(f"#{i+1}: {class_name}\nScore: {score:.3f} ({transform})")
         axes[0, i + 1].axis("off")
-        
+
+        # Row 2: target outline
         axes[1, i + 1].imshow(outline, cmap='gray')
         axes[1, i + 1].set_title("Outline")
         axes[1, i + 1].axis("off")
-        
-        composite = create_composite(patch_transformed, image, x, y, scale, 'alpha', 0.5)
+
+        # Row 3: semi-transparent composite
+        composite = create_composite(patch_transformed, image, x, y, scale,
+                                     'alpha', 0.5, patch_mask=mask_transformed)
         axes[2, i + 1].imshow(composite)
         axes[2, i + 1].set_title("Composite (50%)")
         axes[2, i + 1].axis("off")
-    
-    plt.suptitle(f"Best Matches (GPU: {CUDA_AVAILABLE})", fontsize=14)
+
+    plt.suptitle("Best Matches (Pyramid 4x + BG Removal)", fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Saved: {output_path}")
@@ -762,7 +755,7 @@ if __name__ == "__main__":
     print(f"  Variants: ~{4 * ROTATION_STEPS if ALLOW_ROTATION else 4}")
     print()
     
-    results, patch, patch_outline = search_dataset(
+    results, patch, patch_outline, patch_fg_mask = search_dataset(
         PATCH_PATH,
         num_samples=NUM_SAMPLES,
         top_k=TOP_K,
@@ -776,9 +769,9 @@ if __name__ == "__main__":
         num_threads_segmentation=NUM_THREADS_SEGMENTATION,
         num_threads_matching=NUM_THREADS_MATCHING
     )
-    
+
     print(f"\nTop {TOP_K} matches:")
     for i, r in enumerate(results):
         print(f"  {i+1}. {r['class_name']}: score={r['score']:.3f}, scale={r['scale']:.2f}, transform={r['transform']}")
-    
-    visualize_results(patch, patch_outline, results, BLEND_MODE, ALPHA, OUTPUT_PATH)
+
+    visualize_results(patch, patch_outline, results, patch_fg_mask, BLEND_MODE, ALPHA, OUTPUT_PATH)

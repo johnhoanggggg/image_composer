@@ -3,4 +3,5 @@ numpy==1.26.3
 opencv_python==4.11.0.86
 opencv_python_headless==4.11.0.86
 tensorflow_datasets==4.9.9
+scipy>=1.11.0
 tqdm==4.67.1

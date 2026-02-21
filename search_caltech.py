@@ -4,6 +4,7 @@ Search Caltech101 dataset for best matching images to composite a patch onto.
 Uses outline matching from composite.py approach.
 """
 
+import os
 import tensorflow_datasets as tfds
 import matplotlib.pyplot as plt
 import cv2
@@ -484,7 +485,7 @@ def visualize_results(patch, patch_outline, results, blend_mode='soft', alpha=0.
         image_vis = create_composite(patch_transformed, image, x, y, scale, blend_mode, alpha)
         
         axes[0, i + 1].imshow(image_vis)
-        axes[0, i + 1].set_title(f"#{i+1}: {class_name}\nScore: {score:.3f} ({transform})")
+        axes[0, i + 1].set_title(f"#{i+1}: {class_name}\nScore: {score:.3f} \n scale: ({scale})({transform})")
         axes[0, i + 1].axis("off")
         
         # Row 2: Outline
@@ -512,7 +513,8 @@ if __name__ == "__main__":
     # ============================================================
     # CONFIGURATION - Edit these to match composite.py
     # ============================================================
-    PATCH_PATH = "glock 2.jpeg"      # Path to your patch image
+    PATCH_FOLDER = "image_composer/image_patches"  # Folder containing patch images 
+    PATCH_PATH = os.path.join(PATCH_FOLDER, "fish.jpg")      # Path to your patch image
     OUTPUT_PATH = "search_results.png"   # Output path
     
     MIN_SCALE = 0.1                 # Minimum scale to try

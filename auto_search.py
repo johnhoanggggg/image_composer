@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Auto-search with recursion: find recognizable Caltech101 images, match them,
-then recursively layer more patches on top for increasingly chaotic composites.
+Auto-search with recursion: load user-chosen patches from a folder, match them
+against Caltech101 targets, then recursively layer more patches on top.
 
 Pipeline:
-  1. Samples candidate images from Caltech101, removes background, classifies
-  2. Accepted images become patches, matched against a target pool (level 0)
+  1. Loads patch images from PATCH_DIR, removes background
+  2. Patches are matched against a target pool from Caltech101 (level 0)
   3. Creates initial composite canvases from best matches
   4. For each recursion level:
-     - Samples fresh candidates from unused portion of dataset
-     - Classifies after bg removal, keeps recognizable ones
-     - Precomputes their outlines + variants once
-     - Matches every new patch against each canvas, picks the best per canvas
+     - Cycles through patches again
+     - Matches every patch against each canvas, picks the best per canvas
      - Layers the winning patch on top -> canvas gets more chaotic
   5. Visualizes level-0 results + evolution strip per canvas
 
@@ -21,13 +19,11 @@ Press Play in VS Code to run with the config at the bottom.
 import os
 import glob
 import random
-import math
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-import tensorflow as tf
 import tensorflow_datasets as tfds
 
 from search_caltech_rembg import (
@@ -42,33 +38,61 @@ from search_caltech_rembg import (
     REMBG_AVAILABLE,
     CUDA_AVAILABLE,
 )
-from extract_patches import get_classifier, _INPUT_SIZE
-
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def classify_image(model, img_rgb):
-    """Classify an RGB image. Returns (label, confidence)."""
-    resized = cv2.resize(img_rgb, (_INPUT_SIZE, _INPUT_SIZE))
-    tensor = tf.keras.applications.mobilenet_v2.preprocess_input(
-        resized.astype(np.float32)[np.newaxis]
-    )
-    preds = model(tensor, training=False).numpy()
-    decoded = tf.keras.applications.mobilenet_v2.decode_predictions(preds, top=1)[0]
-    _, label, conf = decoded[0]
-    return label, float(conf)
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 
 
-def composite_fg_on_white(img_rgb, fg_mask):
-    """Composite foreground on white background for classification."""
-    white = np.full_like(img_rgb, 255, dtype=np.float32)
-    blended = (
-        img_rgb.astype(np.float32) * fg_mask[..., None]
-        + white * (1.0 - fg_mask[..., None])
+def load_patches_from_folder(patch_dir):
+    """Load all images from patch_dir, remove background, return accepted list.
+
+    Returns list of dicts with: image, fg_mask, fg_on_white, class_name.
+    """
+    files = sorted(
+        f for f in os.listdir(patch_dir)
+        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
     )
-    return blended.astype(np.uint8)
+    if not files:
+        print(f"No image files found in {patch_dir}")
+        return []
+
+    accepted = []
+    for i, fname in enumerate(files):
+        path = os.path.join(patch_dir, fname)
+        img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            print(f"  [{i+1}/{len(files)}] {fname} — skipped (unreadable)")
+            continue
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        if img_rgb.shape[0] < 64 or img_rgb.shape[1] < 64:
+            print(f"  [{i+1}/{len(files)}] {fname} — skipped (too small)")
+            continue
+
+        fg_mask = _get_patch_fg_mask(img_rgb)
+        # Composite on white for visualization
+        white = np.full_like(img_rgb, 255, dtype=np.float32)
+        fg_on_white = (
+            img_rgb.astype(np.float32) * fg_mask[..., None]
+            + white * (1.0 - fg_mask[..., None])
+        ).astype(np.uint8)
+
+        class_name = os.path.splitext(fname)[0]
+        print(f"  [{i+1}/{len(files)}] {fname} — loaded")
+
+        accepted.append({
+            'image': img_rgb,
+            'fg_mask': fg_mask,
+            'fg_on_white': fg_on_white,
+            'class_name': class_name,
+            'clf_label': class_name,
+            'clf_score': 1.0,
+        })
+
+    return accepted
 
 
 def make_composite(patch_img, fg_mask, target_img, match_result, blend_mode, alpha):
@@ -108,45 +132,6 @@ def outline_from_image(img_rgb, label, max_resolution):
 
 
 # ============================================================
-# CANDIDATE FILTERING
-# ============================================================
-
-def find_recognizable(candidates, label_names, model, threshold):
-    """Remove background from each candidate, classify, keep those above threshold.
-
-    Returns list of dicts: image, fg_mask, fg_on_white, class_name, clf_label, clf_score.
-    """
-    accepted = []
-    for idx, example in enumerate(candidates):
-        img_rgb = example["image"].numpy()
-        label_idx = example["label"].numpy()
-        class_name = label_names(label_idx)
-
-        if img_rgb.shape[0] < 64 or img_rgb.shape[1] < 64:
-            print(f"  [{idx+1}/{len(candidates)}] {class_name} — skipped (too small)")
-            continue
-
-        fg_mask = _get_patch_fg_mask(img_rgb)
-        fg_on_white = composite_fg_on_white(img_rgb, fg_mask)
-        label, conf = classify_image(model, fg_on_white)
-
-        status = "PASS" if conf >= threshold else "skip"
-        print(f"  [{idx+1}/{len(candidates)}] {class_name} -> {label} ({conf:.3f}) [{status}]")
-
-        if conf >= threshold:
-            accepted.append({
-                'image': img_rgb,
-                'fg_mask': fg_mask,
-                'fg_on_white': fg_on_white,
-                'class_name': class_name,
-                'clf_label': label,
-                'clf_score': conf,
-            })
-
-    return accepted
-
-
-# ============================================================
 # MATCHING
 # ============================================================
 
@@ -154,10 +139,7 @@ def search_patches(accepted, targets_processed, config):
     """Run template matching for each accepted patch against the target pool."""
     for i, patch_info in enumerate(accepted):
         img_rgb = patch_info['image']
-        print(
-            f"\nSearching patch {i+1}/{len(accepted)}: "
-            f"{patch_info['class_name']} ({patch_info['clf_label']} {patch_info['clf_score']:.2f})"
-        )
+        print(f"\nSearching patch {i+1}/{len(accepted)}: {patch_info['class_name']}")
 
         patch_proc, patch_scale = resize_to_max(img_rgb, config['max_resolution'])
         patch_outline = get_subject_outline_neural(patch_proc)
@@ -306,7 +288,7 @@ def visualize_summary(accepted, blend_mode, alpha, output_path):
     for r, patch_info in enumerate(patches_with_matches):
         axes[r, 0].imshow(patch_info['image'])
         axes[r, 0].set_ylabel(
-            f"{patch_info['class_name']}\n{patch_info['clf_label']} ({patch_info['clf_score']:.2f})",
+            patch_info['class_name'],
             fontsize=8, rotation=0, labelpad=80, va='center'
         )
         axes[r, 0].axis("off")
@@ -442,19 +424,15 @@ def visualize_debug(accepted, output_path):
 # CONFIGURATION — press Play in VS Code to run
 # ============================================================
 if __name__ == "__main__":
+    PATCH_DIR = "patches"             # Folder of user-chosen patch images
     OUTPUT_DIR = "auto_search_output"
 
-    NUM_TARGETS = 200         # Separate pool to search for matches (level 0)
-    CLASSIFIER_THRESHOLD = 0.3
+    NUM_TARGETS = 200         # Caltech101 images to search for matches
     MATCH_THRESHOLD = 0.4     # Min template match score to accept a match
-    MAX_ACCEPTED = 10         # Desired number of fully-matched patches (level 0)
     TOP_K_MATCHES = 3         # Matches to display per patch (level 0)
-    BATCH_SIZE = 20           # Candidates to screen per retry batch
-    MAX_RETRIES = 10          # Max batches before giving up
 
     # Recursion — layer additional patches onto canvases
     RECURSION_DEPTH = 2               # 0 = no recursion, N = N extra layers per canvas
-    MAX_ACCEPTED_PER_LEVEL = 5        # Desired matched patches per recursion level
 
     # Template matching
     MIN_SCALE = 0.1
@@ -480,12 +458,8 @@ if __name__ == "__main__":
 
     if DEBUG_MODE:
         NUM_TARGETS = 20
-        MAX_ACCEPTED = 3
         TOP_K_MATCHES = 2
-        BATCH_SIZE = 8
-        MAX_RETRIES = 3
         RECURSION_DEPTH = 1
-        MAX_ACCEPTED_PER_LEVEL = 3
         if os.path.isdir(OUTPUT_DIR):
             for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
                 os.remove(f)
@@ -497,37 +471,45 @@ if __name__ == "__main__":
         print("ERROR: rembg is required. Install with: uv pip install rembg")
         exit(1)
 
+    if not os.path.isdir(PATCH_DIR):
+        print(f"ERROR: patch folder '{PATCH_DIR}' not found. Create it and add images.")
+        exit(1)
+
     print("Configuration:")
+    print(f"  Patch folder: {PATCH_DIR}")
     print(f"  Targets: {NUM_TARGETS}")
-    print(f"  Batch size: {BATCH_SIZE}  |  Max retries: {MAX_RETRIES}")
-    print(f"  Classifier threshold: {CLASSIFIER_THRESHOLD}")
     print(f"  Match threshold: {MATCH_THRESHOLD}")
-    print(f"  Desired patches: {MAX_ACCEPTED} (level 0), {MAX_ACCEPTED_PER_LEVEL} (per recursion)")
     print(f"  Recursion depth: {RECURSION_DEPTH}")
     print(f"  CUDA: {CUDA_AVAILABLE}")
     print()
 
     # ----------------------------------------------------------
-    # Load dataset and allocate index pool
+    # Step 1: load patches from folder
+    # ----------------------------------------------------------
+    print(f"Loading patches from {PATCH_DIR}/...")
+    accepted = load_patches_from_folder(PATCH_DIR)
+    print(f"\n{len(accepted)} patches loaded\n")
+
+    if not accepted:
+        print(f"No valid images in {PATCH_DIR}/. Add .png/.jpg files and retry.")
+        exit(0)
+
+    # ----------------------------------------------------------
+    # Step 2: load Caltech101 target pool
     # ----------------------------------------------------------
     print("Loading Caltech101 dataset...")
     ds, info = tfds.load("caltech101", split="train", with_info=True, shuffle_files=True)
     ds_list = list(ds)
-    label_names = info.features["label"].int2str
 
     all_indices = list(range(len(ds_list)))
     random.shuffle(all_indices)
-
-    # Reserve first NUM_TARGETS indices for the target pool
-    idx_offset = 0
-    target_indices = all_indices[idx_offset:idx_offset + NUM_TARGETS]
-    idx_offset += NUM_TARGETS
+    target_indices = all_indices[:NUM_TARGETS]
 
     targets = [ds_list[i] for i in target_indices]
     print(f"  {len(targets)} targets reserved\n")
 
     # ----------------------------------------------------------
-    # Step 1: precompute target outlines (once, shared across all)
+    # Step 3: precompute target outlines
     # ----------------------------------------------------------
     print(f"Precomputing outlines for {len(targets)} targets...")
     targets_processed = precompute_outlines(
@@ -545,57 +527,20 @@ if __name__ == "__main__":
     )
 
     # ----------------------------------------------------------
-    # Step 2: find patches — retry until MAX_ACCEPTED or MAX_RETRIES
+    # Step 4: match all patches against targets, retry skipped ones
     # ----------------------------------------------------------
-    model = get_classifier()
-    accepted = []
-    retries = 0
+    search_patches(accepted, targets_processed, config)
 
-    while len(accepted) < MAX_ACCEPTED and retries < MAX_RETRIES:
-        retries += 1
-        batch_indices = all_indices[idx_offset:idx_offset + BATCH_SIZE]
-        idx_offset += BATCH_SIZE
-
-        if not batch_indices:
-            print("Dataset exhausted.")
-            break
-
-        batch = [ds_list[i] for i in batch_indices]
-        print(f"\nBatch {retries}/{MAX_RETRIES}: classifying {len(batch)} candidates...")
-        batch_accepted = find_recognizable(batch, label_names, model, CLASSIFIER_THRESHOLD)
-
-        if not batch_accepted:
-            print(f"  0 passed classifier, retrying...")
-            continue
-
-        # Sort this batch by classifier score, try best first
-        batch_accepted.sort(key=lambda p: p['clf_score'], reverse=True)
-
-        # Template-match each, keep those above MATCH_THRESHOLD
-        search_patches(batch_accepted, targets_processed, config)
-        matched = [p for p in batch_accepted if p.get('matches')]
-
-        print(f"  {len(matched)} / {len(batch_accepted)} matched above {MATCH_THRESHOLD}")
-        accepted.extend(matched)
-
-        if len(accepted) >= MAX_ACCEPTED:
-            accepted = accepted[:MAX_ACCEPTED]
-            break
-
-    print(f"\n{len(accepted)} fully-matched patches after {retries} batches")
+    # Drop patches that got no matches above threshold
+    before = len(accepted)
+    accepted = [p for p in accepted if p.get('matches')]
+    if before != len(accepted):
+        print(f"\n{before - len(accepted)} patches dropped (no match >= {MATCH_THRESHOLD})")
+    print(f"{len(accepted)} patches with matches\n")
 
     if not accepted:
-        print("No patches survived both thresholds. Lower thresholds or increase MAX_RETRIES.")
+        print("No patches matched above threshold. Lower MATCH_THRESHOLD or add more targets.")
         exit(0)
-
-    if DEBUG_MODE:
-        for i, p in enumerate(accepted):
-            fname = f"patch_{i:02d}_{p['class_name']}_{p['clf_label']}.png"
-            cv2.imwrite(
-                os.path.join(OUTPUT_DIR, fname),
-                cv2.cvtColor(p['fg_on_white'], cv2.COLOR_RGB2BGR)
-            )
-        print(f"Saved {len(accepted)} debug patches to {OUTPUT_DIR}/\n")
 
     # Level-0 visualization
     summary_path = os.path.join(OUTPUT_DIR, "level0_results.png")
@@ -606,7 +551,7 @@ if __name__ == "__main__":
         visualize_debug(accepted, debug_path)
 
     # ----------------------------------------------------------
-    # Step 4: build canvases and recurse
+    # Step 5: build canvases and recurse
     # ----------------------------------------------------------
     canvases = None
     if RECURSION_DEPTH > 0:
@@ -618,32 +563,8 @@ if __name__ == "__main__":
             print(f"RECURSION LEVEL {level+1}/{RECURSION_DEPTH}")
             print(f"{'='*60}")
 
-            # Retry loop: keep sampling until we have enough classified patches
-            new_accepted = []
-            level_retries = 0
-            while len(new_accepted) < MAX_ACCEPTED_PER_LEVEL and level_retries < MAX_RETRIES:
-                level_retries += 1
-                batch_indices = all_indices[idx_offset:idx_offset + BATCH_SIZE]
-                idx_offset += BATCH_SIZE
-
-                if not batch_indices:
-                    print("Dataset exhausted.")
-                    break
-
-                batch = [ds_list[i] for i in batch_indices]
-                print(f"  Batch {level_retries}/{MAX_RETRIES}: classifying {len(batch)}...")
-                batch_ok = find_recognizable(batch, label_names, model, CLASSIFIER_THRESHOLD)
-                new_accepted.extend(batch_ok)
-
-            new_accepted.sort(key=lambda p: p['clf_score'], reverse=True)
-            new_accepted = new_accepted[:MAX_ACCEPTED_PER_LEVEL]
-
-            if not new_accepted:
-                print("No recognizable patches found, stopping recursion.")
-                break
-
-            print(f"  {len(new_accepted)} patches for this level")
-            recurse_level(canvases, new_accepted, config, BLEND_MODE, ALPHA)
+            # Reuse the same user-chosen patches for each recursion level
+            recurse_level(canvases, accepted, config, BLEND_MODE, ALPHA)
 
         # Evolution visualization
         evo_path = os.path.join(OUTPUT_DIR, "evolution.png")
@@ -664,14 +585,11 @@ if __name__ == "__main__":
         if matches:
             best = matches[0]
             print(
-                f"  {i+1}. {p['class_name']} ({p['clf_label']} {p['clf_score']:.2f})"
+                f"  {i+1}. {p['class_name']}"
                 f" -> {best['class_name']} (score={best['score']:.3f})"
             )
         else:
-            print(
-                f"  {i+1}. {p['class_name']} ({p['clf_label']} {p['clf_score']:.2f})"
-                f" -> no match"
-            )
+            print(f"  {i+1}. {p['class_name']} -> no match")
 
     if canvases:
         print(f"\nCanvases after {RECURSION_DEPTH} recursion levels:")

@@ -519,7 +519,11 @@ def match_single_image(args):
                 'y': int(y / img_scale),
                 'scale': match_scale * (patch_scale / img_scale),
                 'score': score,
-                'transform': transform
+                'transform': transform,
+                'target_outline': target_outline,
+                'img_scale': img_scale,
+                'match_scale': match_scale,
+                'outline_var': outline_var,
             }
 
             # Early termination: very high score means we won't do much better
@@ -729,6 +733,82 @@ def visualize_results(patch, patch_outline, results, patch_fg_mask=None,
     plt.show()
 
 
+def visualize_debug_outlines(patch, patch_outline, results, output_path="debug_outlines.png"):
+    """Debug view: for each top match show the patch outline, target outline,
+    and the scaled patch outline overlaid on the target outline at the match position."""
+    import math
+    n = len(results)
+    cols = n
+    rows = 3  # row 0 = patch outline variant, row 1 = target outline, row 2 = overlay
+
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    if cols == 1:
+        axes = axes[:, np.newaxis]
+
+    for i, result in enumerate(results):
+        transform = result['transform']
+        target_outline = result['target_outline']
+        img_scale = result['img_scale']
+        match_scale = result['match_scale']
+        outline_var = result['outline_var']
+        x_proc = int(result['x'] * img_scale)
+        y_proc = int(result['y'] * img_scale)
+
+        # Row 0: patch outline variant (what was actually matched)
+        axes[0, i].imshow(outline_var, cmap='gray')
+        axes[0, i].set_title(f"Patch outline\n({transform})", fontsize=7)
+        axes[0, i].axis("off")
+
+        # Row 1: target outline
+        axes[1, i].imshow(target_outline, cmap='gray')
+        axes[1, i].set_title(f"Target outline\n{result['class_name']}", fontsize=7)
+        axes[1, i].axis("off")
+
+        # Row 2: overlay — scale the patch outline and place it on the target
+        th, tw = target_outline.shape[:2]
+        ph, pw = outline_var.shape[:2]
+        new_w = int(pw * match_scale)
+        new_h = int(ph * match_scale)
+
+        # RGB overlay: target outline in blue, patch outline in red
+        overlay = np.zeros((th, tw, 3), dtype=np.uint8)
+        overlay[:, :, 2] = target_outline  # blue channel
+
+        if new_w > 0 and new_h > 0:
+            patch_scaled = cv2.resize(outline_var, (new_w, new_h))
+            # Clip to target bounds
+            x1 = max(0, x_proc)
+            y1 = max(0, y_proc)
+            x2 = min(tw, x_proc + new_w)
+            y2 = min(th, y_proc + new_h)
+            px1 = max(0, -x_proc)
+            py1 = max(0, -y_proc)
+            px2 = px1 + (x2 - x1)
+            py2 = py1 + (y2 - y1)
+            if x2 > x1 and y2 > y1:
+                overlay[y1:y2, x1:x2, 0] = np.maximum(
+                    overlay[y1:y2, x1:x2, 0],
+                    patch_scaled[py1:py2, px1:px2]
+                )  # red channel
+
+        axes[2, i].imshow(overlay)
+        axes[2, i].set_title(
+            f"Overlay  score={result['score']:.3f}\n"
+            f"scale={match_scale:.2f}  pos=({x_proc},{y_proc})",
+            fontsize=7
+        )
+        axes[2, i].axis("off")
+
+    axes[0, 0].set_ylabel("Patch outline", fontsize=9)
+    axes[1, 0].set_ylabel("Target outline", fontsize=9)
+    axes[2, 0].set_ylabel("Overlay (R=patch B=target)", fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Debug outlines saved: {output_path}")
+    plt.show()
+
+
 # ======================
 # MAIN
 # ======================
@@ -800,3 +880,6 @@ if __name__ == "__main__":
         print(f"  {i+1}. {r['class_name']}: score={r['score']:.3f}, scale={r['scale']:.2f}, transform={r['transform']}")
 
     visualize_results(patch, patch_outline, results, patch_fg_mask, BLEND_MODE, ALPHA, OUTPUT_PATH)
+
+    if DEBUG_MODE and results:
+        visualize_debug_outlines(patch, patch_outline, results, "debug_outlines.png")

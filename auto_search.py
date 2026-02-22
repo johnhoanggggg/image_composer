@@ -444,17 +444,17 @@ def visualize_debug(accepted, output_path):
 if __name__ == "__main__":
     OUTPUT_DIR = "auto_search_output"
 
-    NUM_CANDIDATES = 50       # Images to screen as potential patches (level 0)
     NUM_TARGETS = 200         # Separate pool to search for matches (level 0)
     CLASSIFIER_THRESHOLD = 0.3
     MATCH_THRESHOLD = 0.4     # Min template match score to accept a match
-    MAX_ACCEPTED = 10         # Keep top N most-recognizable patches (level 0)
+    MAX_ACCEPTED = 10         # Desired number of fully-matched patches (level 0)
     TOP_K_MATCHES = 3         # Matches to display per patch (level 0)
+    BATCH_SIZE = 20           # Candidates to screen per retry batch
+    MAX_RETRIES = 10          # Max batches before giving up
 
     # Recursion — layer additional patches onto canvases
     RECURSION_DEPTH = 2               # 0 = no recursion, N = N extra layers per canvas
-    CANDIDATES_PER_LEVEL = 30         # Fresh candidates sampled at each recursion level
-    MAX_ACCEPTED_PER_LEVEL = 5        # Best new patches to try per level
+    MAX_ACCEPTED_PER_LEVEL = 5        # Desired matched patches per recursion level
 
     # Template matching
     MIN_SCALE = 0.1
@@ -479,12 +479,12 @@ if __name__ == "__main__":
     # ============================================================
 
     if DEBUG_MODE:
-        NUM_CANDIDATES = 10
         NUM_TARGETS = 20
         MAX_ACCEPTED = 3
         TOP_K_MATCHES = 2
+        BATCH_SIZE = 8
+        MAX_RETRIES = 3
         RECURSION_DEPTH = 1
-        CANDIDATES_PER_LEVEL = 8
         MAX_ACCEPTED_PER_LEVEL = 3
         if os.path.isdir(OUTPUT_DIR):
             for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
@@ -498,16 +498,17 @@ if __name__ == "__main__":
         exit(1)
 
     print("Configuration:")
-    print(f"  Candidates: {NUM_CANDIDATES} + {RECURSION_DEPTH}x{CANDIDATES_PER_LEVEL}")
     print(f"  Targets: {NUM_TARGETS}")
+    print(f"  Batch size: {BATCH_SIZE}  |  Max retries: {MAX_RETRIES}")
     print(f"  Classifier threshold: {CLASSIFIER_THRESHOLD}")
     print(f"  Match threshold: {MATCH_THRESHOLD}")
+    print(f"  Desired patches: {MAX_ACCEPTED} (level 0), {MAX_ACCEPTED_PER_LEVEL} (per recursion)")
     print(f"  Recursion depth: {RECURSION_DEPTH}")
     print(f"  CUDA: {CUDA_AVAILABLE}")
     print()
 
     # ----------------------------------------------------------
-    # Load dataset and allocate index ranges
+    # Load dataset and allocate index pool
     # ----------------------------------------------------------
     print("Loading Caltech101 dataset...")
     ds, info = tfds.load("caltech101", split="train", with_info=True, shuffle_files=True)
@@ -517,52 +518,22 @@ if __name__ == "__main__":
     all_indices = list(range(len(ds_list)))
     random.shuffle(all_indices)
 
+    # Reserve first NUM_TARGETS indices for the target pool
     idx_offset = 0
-    candidate_indices = all_indices[idx_offset:idx_offset + NUM_CANDIDATES]
-    idx_offset += NUM_CANDIDATES
     target_indices = all_indices[idx_offset:idx_offset + NUM_TARGETS]
     idx_offset += NUM_TARGETS
 
-    candidates = [ds_list[i] for i in candidate_indices]
     targets = [ds_list[i] for i in target_indices]
-    print(f"  {len(candidates)} candidates, {len(targets)} targets (no overlap)\n")
+    print(f"  {len(targets)} targets reserved\n")
 
     # ----------------------------------------------------------
-    # Step 1: classify candidates after bg removal
-    # ----------------------------------------------------------
-    print(f"Classifying {len(candidates)} candidates (bg removed)...")
-    model = get_classifier()
-    accepted = find_recognizable(candidates, label_names, model, CLASSIFIER_THRESHOLD)
-    print(f"\n{len(accepted)} / {len(candidates)} passed threshold ({CLASSIFIER_THRESHOLD})")
-
-    if not accepted:
-        print("No recognizable patches found. Try lowering CLASSIFIER_THRESHOLD.")
-        exit(0)
-
-    accepted.sort(key=lambda p: p['clf_score'], reverse=True)
-    accepted = accepted[:MAX_ACCEPTED]
-    print(f"Using top {len(accepted)} patches\n")
-
-    if DEBUG_MODE:
-        for i, p in enumerate(accepted):
-            fname = f"patch_{i:02d}_{p['class_name']}_{p['clf_label']}.png"
-            cv2.imwrite(
-                os.path.join(OUTPUT_DIR, fname),
-                cv2.cvtColor(p['fg_on_white'], cv2.COLOR_RGB2BGR)
-            )
-        print(f"Saved {len(accepted)} debug patches to {OUTPUT_DIR}/\n")
-
-    # ----------------------------------------------------------
-    # Step 2: precompute target outlines (once, shared across patches)
+    # Step 1: precompute target outlines (once, shared across all)
     # ----------------------------------------------------------
     print(f"Precomputing outlines for {len(targets)} targets...")
     targets_processed = precompute_outlines(
         targets, info, MAX_RESOLUTION, NUM_THREADS_SEGMENTATION
     )
 
-    # ----------------------------------------------------------
-    # Step 3: level-0 search
-    # ----------------------------------------------------------
     config = dict(
         min_scale=MIN_SCALE, max_scale=MAX_SCALE, scale_steps=SCALE_STEPS,
         allow_flip=ALLOW_FLIP, allow_rotation=ALLOW_ROTATION,
@@ -572,18 +543,59 @@ if __name__ == "__main__":
         top_k=TOP_K_MATCHES,
         match_threshold=MATCH_THRESHOLD,
     )
-    search_patches(accepted, targets_processed, config)
 
-    # Drop patches that got no matches above threshold
-    before = len(accepted)
-    accepted = [p for p in accepted if p.get('matches')]
-    if before != len(accepted):
-        print(f"\n{before - len(accepted)} patches dropped (no match >= {MATCH_THRESHOLD})")
-        print(f"{len(accepted)} patches remaining")
+    # ----------------------------------------------------------
+    # Step 2: find patches — retry until MAX_ACCEPTED or MAX_RETRIES
+    # ----------------------------------------------------------
+    model = get_classifier()
+    accepted = []
+    retries = 0
+
+    while len(accepted) < MAX_ACCEPTED and retries < MAX_RETRIES:
+        retries += 1
+        batch_indices = all_indices[idx_offset:idx_offset + BATCH_SIZE]
+        idx_offset += BATCH_SIZE
+
+        if not batch_indices:
+            print("Dataset exhausted.")
+            break
+
+        batch = [ds_list[i] for i in batch_indices]
+        print(f"\nBatch {retries}/{MAX_RETRIES}: classifying {len(batch)} candidates...")
+        batch_accepted = find_recognizable(batch, label_names, model, CLASSIFIER_THRESHOLD)
+
+        if not batch_accepted:
+            print(f"  0 passed classifier, retrying...")
+            continue
+
+        # Sort this batch by classifier score, try best first
+        batch_accepted.sort(key=lambda p: p['clf_score'], reverse=True)
+
+        # Template-match each, keep those above MATCH_THRESHOLD
+        search_patches(batch_accepted, targets_processed, config)
+        matched = [p for p in batch_accepted if p.get('matches')]
+
+        print(f"  {len(matched)} / {len(batch_accepted)} matched above {MATCH_THRESHOLD}")
+        accepted.extend(matched)
+
+        if len(accepted) >= MAX_ACCEPTED:
+            accepted = accepted[:MAX_ACCEPTED]
+            break
+
+    print(f"\n{len(accepted)} fully-matched patches after {retries} batches")
 
     if not accepted:
-        print("No patches with matches above threshold. Lower MATCH_THRESHOLD or add more targets.")
+        print("No patches survived both thresholds. Lower thresholds or increase MAX_RETRIES.")
         exit(0)
+
+    if DEBUG_MODE:
+        for i, p in enumerate(accepted):
+            fname = f"patch_{i:02d}_{p['class_name']}_{p['clf_label']}.png"
+            cv2.imwrite(
+                os.path.join(OUTPUT_DIR, fname),
+                cv2.cvtColor(p['fg_on_white'], cv2.COLOR_RGB2BGR)
+            )
+        print(f"Saved {len(accepted)} debug patches to {OUTPUT_DIR}/\n")
 
     # Level-0 visualization
     summary_path = os.path.join(OUTPUT_DIR, "level0_results.png")
@@ -606,29 +618,31 @@ if __name__ == "__main__":
             print(f"RECURSION LEVEL {level+1}/{RECURSION_DEPTH}")
             print(f"{'='*60}")
 
-            # Consume fresh indices from the shuffled pool
-            new_indices = all_indices[idx_offset:idx_offset + CANDIDATES_PER_LEVEL]
-            idx_offset += CANDIDATES_PER_LEVEL
+            # Retry loop: keep sampling until we have enough classified patches
+            new_accepted = []
+            level_retries = 0
+            while len(new_accepted) < MAX_ACCEPTED_PER_LEVEL and level_retries < MAX_RETRIES:
+                level_retries += 1
+                batch_indices = all_indices[idx_offset:idx_offset + BATCH_SIZE]
+                idx_offset += BATCH_SIZE
 
-            if not new_indices:
-                print("Dataset exhausted, stopping recursion.")
-                break
+                if not batch_indices:
+                    print("Dataset exhausted.")
+                    break
 
-            new_candidates = [ds_list[i] for i in new_indices]
-            print(f"Classifying {len(new_candidates)} new candidates...")
-            new_accepted = find_recognizable(
-                new_candidates, label_names, model, CLASSIFIER_THRESHOLD
-            )
-            print(f"  {len(new_accepted)} passed threshold")
+                batch = [ds_list[i] for i in batch_indices]
+                print(f"  Batch {level_retries}/{MAX_RETRIES}: classifying {len(batch)}...")
+                batch_ok = find_recognizable(batch, label_names, model, CLASSIFIER_THRESHOLD)
+                new_accepted.extend(batch_ok)
 
             new_accepted.sort(key=lambda p: p['clf_score'], reverse=True)
             new_accepted = new_accepted[:MAX_ACCEPTED_PER_LEVEL]
 
             if not new_accepted:
-                print("No recognizable patches at this level, stopping.")
+                print("No recognizable patches found, stopping recursion.")
                 break
 
-            print(f"  Using top {len(new_accepted)} patches")
+            print(f"  {len(new_accepted)} patches for this level")
             recurse_level(canvases, new_accepted, config, BLEND_MODE, ALPHA)
 
         # Evolution visualization

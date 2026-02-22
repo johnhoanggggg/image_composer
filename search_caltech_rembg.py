@@ -217,6 +217,14 @@ def get_patch_variants(patch, outline, allow_flip=True, allow_rotation=False, ro
                 M[1, 2] += (new_h - h) / 2
                 p_rot = cv2.warpAffine(p_flip, M, (new_w, new_h))
                 o_rot = cv2.warpAffine(o_flip, M, (new_w, new_h))
+                # Crop to tight bounding box of the outline to remove
+                # black padding that inflates the template size and
+                # dilutes match scores vs cardinal rotations
+                coords = cv2.findNonZero(o_rot)
+                if coords is not None:
+                    rx, ry, rw, rh = cv2.boundingRect(coords)
+                    o_rot = o_rot[ry:ry+rh, rx:rx+rw]
+                    p_rot = p_rot[ry:ry+rh, rx:rx+rw]
                 rot_name = f'rot{int(angle)}'
             
             name = f'{rot_name}_{flip_name}' if (flip_name and rot_name) else (flip_name or rot_name or 'original')
@@ -648,23 +656,12 @@ def _apply_transform(img, transform):
 
 def visualize_results(patch, patch_outline, results, patch_fg_mask=None,
                       blend_mode='soft', alpha=0.9, output_path="search_results.png"):
-    """Visualize top matches. Uses patch_fg_mask to remove patch background."""
+    """Visualize top matches as overlaid patches on target images only."""
     n = len(results)
-    fig, axes = plt.subplots(3, n + 1, figsize=(4 * (n + 1), 12))
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
 
-    axes[0, 0].imshow(patch)
-    axes[0, 0].set_title("Patch")
-    axes[0, 0].axis("off")
-
-    axes[1, 0].imshow(patch_outline, cmap='gray')
-    axes[1, 0].set_title("Patch Outline")
-    axes[1, 0].axis("off")
-
-    # Show the foreground mask
-    if patch_fg_mask is not None:
-        axes[2, 0].imshow(patch_fg_mask, cmap='gray')
-        axes[2, 0].set_title("FG Mask")
-    axes[2, 0].axis("off")
+    if n == 1:
+        axes = [axes]
 
     for i, result in enumerate(results):
         image = result['image']
@@ -676,28 +673,13 @@ def visualize_results(patch, patch_outline, results, patch_fg_mask=None,
         patch_transformed = _apply_transform(patch, transform)
         mask_transformed = _apply_transform(patch_fg_mask, transform) if patch_fg_mask is not None else None
 
-        outline = get_subject_outline_neural(image)
-
-        # Row 1: composite with background removed
+        # Composite patch onto target
         image_vis = create_composite(patch_transformed, image, x, y, scale,
                                      blend_mode, alpha, patch_mask=mask_transformed)
-        axes[0, i + 1].imshow(image_vis)
-        axes[0, i + 1].set_title(f"#{i+1}: {class_name}\nScore: {score:.3f} ({transform})")
-        axes[0, i + 1].axis("off")
+        axes[i].imshow(image_vis)
+        axes[i].set_title(f"#{i+1}: {class_name}\nScore: {score:.3f} ({transform})")
+        axes[i].axis("off")
 
-        # Row 2: target outline
-        axes[1, i + 1].imshow(outline, cmap='gray')
-        axes[1, i + 1].set_title("Outline")
-        axes[1, i + 1].axis("off")
-
-        # Row 3: semi-transparent composite
-        composite = create_composite(patch_transformed, image, x, y, scale,
-                                     'alpha', 0.5, patch_mask=mask_transformed)
-        axes[2, i + 1].imshow(composite)
-        axes[2, i + 1].set_title("Composite (50%)")
-        axes[2, i + 1].axis("off")
-
-    plt.suptitle("Best Matches (Pyramid 4x + BG Removal)", fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Saved: {output_path}")

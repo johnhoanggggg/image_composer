@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Extract recognizable patches from an image using a pretrained classifier.
+Extract recognizable patches from an image using GradCAM-guided extraction.
 
-Slides windows across the source image at multiple scales, runs each patch
-through a MobileNetV2 classifier, and saves patches where the top-1
-classification confidence is high — meaning the model recognizes a clear
-subject in that crop.
+Instead of sliding a window and classifying every crop (slow), this:
+  1. Runs the classifier ONCE on the full image to get top predictions
+  2. Computes GradCAM heatmaps to locate where each prediction fires
+  3. Finds peak regions in the heatmaps
+  4. Extracts patches centered on those peaks at multiple scales
+  5. Re-classifies each candidate patch to confirm + get final scores
+
+This is orders of magnitude faster than brute-force sliding window.
 
 Goal: build a folder of recognizable patches to later match against
 larger target images with search_caltech_rembg.py.
 
 Usage:
     python extract_patches.py photo.jpg
-    python extract_patches.py photo.jpg --threshold 0.3 --max_patches 20
-    python extract_patches.py photo.jpg --patch_sizes 96 160 224 --stride 0.4
+    python extract_patches.py photo.jpg --threshold 0.15 --max_patches 20
+    python extract_patches.py photo.jpg --top_classes 10 --patch_scales 0.15 0.25 0.4
 """
 
 import os
@@ -38,32 +42,72 @@ def get_classifier():
     return _model
 
 
-def classify_patch(patch_rgb, model):
-    """Run a single patch through the classifier.
+def gradcam(model, img_tensor, class_index):
+    """Compute GradCAM heatmap for a given class.
 
-    Returns (score, label) where score is the top-1 softmax probability
-    and label is the predicted ImageNet class name.
+    Returns a heatmap (H x W) in [0, 1] showing where the class activates.
     """
-    resized = cv2.resize(patch_rgb, (_INPUT_SIZE, _INPUT_SIZE))
-    x = tf.keras.applications.mobilenet_v2.preprocess_input(
-        resized.astype(np.float32)[np.newaxis]
+    # Last conv layer in MobileNetV2
+    last_conv = model.get_layer("out_relu")
+
+    grad_model = tf.keras.Model(
+        inputs=model.input,
+        outputs=[last_conv.output, model.output]
     )
-    preds = model(x, training=False).numpy()
-    decoded = tf.keras.applications.mobilenet_v2.decode_predictions(preds, top=1)[0]
-    _, label, confidence = decoded[0]
-    return float(confidence), label
+
+    with tf.GradientTape() as tape:
+        conv_out, predictions = grad_model(img_tensor, training=False)
+        class_score = predictions[:, class_index]
+
+    grads = tape.gradient(class_score, conv_out)
+    # Global average pooling of gradients
+    weights = tf.reduce_mean(grads, axis=(1, 2), keepdims=True)
+    cam = tf.reduce_sum(conv_out * weights, axis=-1).numpy()[0]
+
+    # ReLU + normalize
+    cam = np.maximum(cam, 0)
+    if cam.max() > 0:
+        cam = cam / cam.max()
+
+    return cam
 
 
-def extract_patches(image_path, output_dir, patch_sizes=(96, 160, 224),
-                    stride_fraction=0.5, threshold=0.15, max_patches=50):
-    """Extract recognizable patches from an image.
+def find_peaks(heatmap, min_distance=20, threshold_rel=0.3):
+    """Find local maxima in a heatmap.
+
+    Returns list of (y, x, intensity) sorted by intensity descending.
+    """
+    h, w = heatmap.shape
+    thresh = threshold_rel * heatmap.max()
+    peaks = []
+
+    # Simple non-maximum suppression on a grid
+    step = max(1, min_distance // 2)
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            y1 = max(0, y - min_distance)
+            y2 = min(h, y + min_distance + 1)
+            x1 = max(0, x - min_distance)
+            x2 = min(w, x + min_distance + 1)
+            local_max = heatmap[y1:y2, x1:x2].max()
+            if heatmap[y, x] == local_max and heatmap[y, x] >= thresh:
+                peaks.append((y, x, float(heatmap[y, x])))
+
+    peaks.sort(key=lambda p: p[2], reverse=True)
+    return peaks
+
+
+def extract_patches(image_path, output_dir, top_classes=10,
+                    patch_scales=(0.15, 0.25, 0.4),
+                    threshold=0.15, max_patches=50):
+    """Extract recognizable patches using GradCAM-guided search.
 
     Args:
         image_path: Path to the source image.
         output_dir: Folder to save accepted patches into.
-        patch_sizes: Window sizes to try (pixels).
-        stride_fraction: Stride as fraction of patch size (0.5 = 50% overlap).
-        threshold: Minimum classifier confidence to keep a patch.
+        top_classes: Number of top classifier predictions to generate heatmaps for.
+        patch_scales: Patch sizes as fractions of the image's shorter side.
+        threshold: Minimum classifier confidence to keep a re-classified patch.
         max_patches: Maximum number of patches to save.
     """
     img = cv2.imread(image_path)
@@ -71,38 +115,87 @@ def extract_patches(image_path, output_dir, patch_sizes=(96, 160, 224),
         raise ValueError(f"Could not load image: {image_path}")
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_h, img_w = img_rgb.shape[:2]
+    short_side = min(img_h, img_w)
 
     os.makedirs(output_dir, exist_ok=True)
     model = get_classifier()
-
     base_name = os.path.splitext(os.path.basename(image_path))[0]
+
+    # Step 1: classify full image once
+    resized = cv2.resize(img_rgb, (_INPUT_SIZE, _INPUT_SIZE))
+    img_tensor = tf.keras.applications.mobilenet_v2.preprocess_input(
+        resized.astype(np.float32)[np.newaxis]
+    )
+    preds = model(img_tensor, training=False).numpy()
+    top_indices = np.argsort(preds[0])[::-1][:top_classes]
+
+    decoded = tf.keras.applications.mobilenet_v2.decode_predictions(preds, top=top_classes)[0]
+    print(f"Top {top_classes} predictions for full image:")
+    for _, label, conf in decoded:
+        print(f"  {label}: {conf:.3f}")
+
+    # Step 2: compute GradCAM for each top class, find peaks
+    candidate_regions = []  # (cy_frac, cx_frac, class_idx, label, heatmap_intensity)
+
+    for rank, class_idx in enumerate(top_indices):
+        cam = gradcam(model, img_tensor, int(class_idx))
+        peaks = find_peaks(cam, min_distance=3, threshold_rel=0.3)
+
+        cam_h, cam_w = cam.shape
+        _, label, _ = decoded[rank]
+
+        for py, px, intensity in peaks[:5]:  # top 5 peaks per class
+            cy_frac = py / cam_h
+            cx_frac = px / cam_w
+            candidate_regions.append((cy_frac, cx_frac, int(class_idx), label, intensity))
+
+    print(f"\nFound {len(candidate_regions)} candidate regions from GradCAM peaks")
+
+    # Step 3: extract patches at each peak at multiple scales, re-classify
     candidates = []
+    seen_centers = set()
 
-    print(f"Scanning {image_path} ({img_w}x{img_h}) with patch sizes {patch_sizes}")
+    for cy_frac, cx_frac, class_idx, cam_label, intensity in candidate_regions:
+        cy_px = int(cy_frac * img_h)
+        cx_px = int(cx_frac * img_w)
 
-    for patch_size in patch_sizes:
-        if patch_size > min(img_h, img_w):
-            continue
+        for scale in patch_scales:
+            patch_size = max(32, int(short_side * scale))
 
-        stride = max(16, int(patch_size * stride_fraction))
-        n_y = len(range(0, img_h - patch_size + 1, stride))
-        n_x = len(range(0, img_w - patch_size + 1, stride))
+            x1 = max(0, cx_px - patch_size // 2)
+            y1 = max(0, cy_px - patch_size // 2)
+            x2 = min(img_w, x1 + patch_size)
+            y2 = min(img_h, y1 + patch_size)
+            x1 = max(0, x2 - patch_size)
+            y1 = max(0, y2 - patch_size)
 
-        print(f"  Patch size {patch_size}: {n_y * n_x} windows (stride {stride})")
+            # Skip near-duplicate regions
+            center_key = (y1 // 20, x1 // 20, patch_size // 20)
+            if center_key in seen_centers:
+                continue
+            seen_centers.add(center_key)
 
-        for y in range(0, img_h - patch_size + 1, stride):
-            for x in range(0, img_w - patch_size + 1, stride):
-                patch = img_rgb[y:y + patch_size, x:x + patch_size]
-                score, label = classify_patch(patch, model)
+            patch = img_rgb[y1:y2, x1:x2]
+            if patch.shape[0] < 16 or patch.shape[1] < 16:
+                continue
 
-                if score >= threshold:
-                    candidates.append({
-                        'patch': patch,
-                        'score': score,
-                        'label': label,
-                        'x': x, 'y': y,
-                        'size': patch_size,
-                    })
+            # Re-classify this specific crop
+            p_resized = cv2.resize(patch, (_INPUT_SIZE, _INPUT_SIZE))
+            p_tensor = tf.keras.applications.mobilenet_v2.preprocess_input(
+                p_resized.astype(np.float32)[np.newaxis]
+            )
+            p_preds = model(p_tensor, training=False).numpy()
+            p_decoded = tf.keras.applications.mobilenet_v2.decode_predictions(p_preds, top=1)[0]
+            _, label, confidence = p_decoded[0]
+
+            if confidence >= threshold:
+                candidates.append({
+                    'patch': patch,
+                    'score': float(confidence),
+                    'label': label,
+                    'x': x1, 'y': y1,
+                    'size': patch_size,
+                })
 
     # Sort by score descending
     candidates.sort(key=lambda c: c['score'], reverse=True)
@@ -192,14 +285,14 @@ def _visualize_kept(img_rgb, kept, output_dir, base_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract recognizable patches from an image using a classifier")
+        description="Extract recognizable patches from an image using GradCAM-guided search")
     parser.add_argument("image", help="Path to source image")
     parser.add_argument("--output_dir", default="image_patches",
                         help="Output folder for patches (default: image_patches)")
-    parser.add_argument("--patch_sizes", nargs="+", type=int, default=[96, 160, 224],
-                        help="Patch window sizes in pixels (default: 96 160 224)")
-    parser.add_argument("--stride", type=float, default=0.5,
-                        help="Stride as fraction of patch size (default: 0.5)")
+    parser.add_argument("--top_classes", type=int, default=10,
+                        help="Number of top predictions to compute heatmaps for (default: 10)")
+    parser.add_argument("--patch_scales", nargs="+", type=float, default=[0.15, 0.25, 0.4],
+                        help="Patch sizes as fractions of short side (default: 0.15 0.25 0.4)")
     parser.add_argument("--threshold", type=float, default=0.15,
                         help="Minimum classifier confidence to keep (default: 0.15)")
     parser.add_argument("--max_patches", type=int, default=50,
@@ -210,8 +303,8 @@ if __name__ == "__main__":
     extract_patches(
         args.image,
         output_dir=args.output_dir,
-        patch_sizes=args.patch_sizes,
-        stride_fraction=args.stride,
+        top_classes=args.top_classes,
+        patch_scales=args.patch_scales,
         threshold=args.threshold,
         max_patches=args.max_patches,
     )

@@ -296,12 +296,13 @@ def _refine_at_full_res(patch_outline, target_outline, scales, ph, pw, th, tw, t
     return best_result
 
 
-def match_outlines(patch_outline, target_outline, min_scale=0.1, max_scale=0.9, scale_steps=20):
+def match_outlines(patch_outline, target_outline, min_scale=0.1, max_scale=0.9,
+                    scale_steps=20, max_resolution=320):
     """Pyramid 4x matching: coarse pass at 1/4 resolution, refine top scales at full res.
 
-    Scales are expressed as fractions of the target's longer side, not as
-    multipliers on the patch.  e.g. min_scale=0.1 means the patch's longer
-    side will be at least 10% of the target's longer side.
+    Scales are fractions of max_resolution.  e.g. min_scale=0.3 means the
+    patch's longer side will be at least 30% of max_resolution, regardless
+    of the patch image or target image dimensions.
 
     1. Downsample both outlines by 4x
     2. Run template matching at all scales on the small images (very fast)
@@ -311,13 +312,12 @@ def match_outlines(patch_outline, target_outline, min_scale=0.1, max_scale=0.9, 
     ph, pw = patch_outline.shape[:2]
     th, tw = target_outline.shape[:2]
 
-    # Convert target-relative scales to patch multipliers
-    target_max = max(th, tw)
+    # Convert max_resolution-relative scales to patch multipliers
     patch_max = max(ph, pw)
     if patch_max == 0:
         return (0, 0, 1.0, -1)
-    internal_min = min_scale * target_max / patch_max
-    internal_max = max_scale * target_max / patch_max
+    internal_min = min_scale * max_resolution / patch_max
+    internal_max = max_scale * max_resolution / patch_max
 
     # --- Level 1: Downsample by 4x ---
     ds = 4
@@ -491,7 +491,7 @@ def precompute_outlines(samples, info, max_resolution, num_threads=1):
 def match_single_image(args):
     """Match a single image against all patch variants.
     Includes early termination: if a near-perfect match is found, skip remaining variants."""
-    data, variants, min_scale, max_scale, scale_steps, patch_scale, early_stop_threshold = args
+    data, variants, min_scale, max_scale, scale_steps, patch_scale, early_stop_threshold, max_resolution = args
 
     target_outline = data['outline']
     img_scale = data['img_scale']
@@ -506,7 +506,8 @@ def match_single_image(args):
     for patch_var, outline_var, transform in variants:
         x, y, match_scale, score = match_outlines(
             outline_var, target_outline,
-            min_scale=min_scale, max_scale=max_scale, scale_steps=scale_steps
+            min_scale=min_scale, max_scale=max_scale, scale_steps=scale_steps,
+            max_resolution=max_resolution
         )
 
         if score > best_var_score:
@@ -529,13 +530,13 @@ def match_single_image(args):
 
 
 def match_all_images(processed_images, variants, min_scale, max_scale, scale_steps,
-                     patch_scale, num_threads=4, early_stop_threshold=0.95):
+                     patch_scale, num_threads=4, early_stop_threshold=0.95, max_resolution=320):
     """Match outlines with threading. Includes early-stop threshold per image."""
     print(f"Matching {len(processed_images)} images against {len(variants)} variants using {num_threads} threads...")
 
     results = []
     args_list = [
-        (data, variants, min_scale, max_scale, scale_steps, patch_scale, early_stop_threshold)
+        (data, variants, min_scale, max_scale, scale_steps, patch_scale, early_stop_threshold, max_resolution)
         for data in processed_images
     ]
 
@@ -623,7 +624,7 @@ def search_dataset(patch_path, num_samples=200, top_k=5,
     # Phase 2: Match outlines (pyramid 4x matching, benefits from threading)
     results = match_all_images(
         processed, variants, min_scale, max_scale, scale_steps, patch_scale,
-        num_threads_matching, early_stop_threshold
+        num_threads_matching, early_stop_threshold, max_resolution
     )
 
     # Sort and return top results

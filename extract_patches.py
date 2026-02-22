@@ -364,6 +364,18 @@ if __name__ == "__main__":
     PADDING = 0.25           # 25% padding around the GradCAM activation region
     MIN_FRAC = 0.15          # Minimum patch size as fraction of image dimension
 
+    DEBUG_MODE = False
+
+    # ============================================================
+
+    if DEBUG_MODE:
+        import glob
+        import shutil
+        print("DEBUG MODE: clearing output folder")
+        for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
+            os.remove(f)
+        NUM_IMAGES = 3
+
     print(f"Configuration:")
     print(f"  Source: {NUM_IMAGES} random Caltech101 images")
     print(f"  Top classes per image: {TOP_CLASSES}")

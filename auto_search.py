@@ -176,6 +176,8 @@ def search_patches(accepted, targets_processed, config):
         )
 
         results.sort(key=lambda r: r['score'], reverse=True)
+        match_thresh = config.get('match_threshold', 0.0)
+        results = [r for r in results if r['score'] >= match_thresh]
         patch_info['matches'] = results[:config['top_k']]
         patch_info['outline'] = patch_outline
         patch_info['patch_scale'] = patch_scale
@@ -184,7 +186,7 @@ def search_patches(accepted, targets_processed, config):
             top = patch_info['matches'][0]
             print(f"  Best: {top['class_name']} score={top['score']:.3f}")
         else:
-            print(f"  No matches found")
+            print(f"  No matches above {match_thresh}")
 
 
 # ============================================================
@@ -264,7 +266,8 @@ def recurse_level(canvases, new_accepted, config, blend_mode, alpha):
                 best_result = results[0]
                 best_patch_info = pd['patch_info']
 
-        if best_result and best_patch_info:
+        match_thresh = config.get('match_threshold', 0.0)
+        if best_result and best_patch_info and best_score >= match_thresh:
             composite = make_composite(
                 best_patch_info['image'], best_patch_info['fg_mask'],
                 canvas['image'], best_result, blend_mode, alpha
@@ -274,7 +277,7 @@ def recurse_level(canvases, new_accepted, config, blend_mode, alpha):
             canvas['history'].append(composite.copy())
             print(f"    Canvas {c_idx}: +{best_patch_info['class_name']} (score={best_score:.3f})")
         else:
-            print(f"    Canvas {c_idx}: no match found")
+            print(f"    Canvas {c_idx}: no match above {match_thresh} (best={best_score:.3f})")
 
 
 # ============================================================
@@ -444,6 +447,7 @@ if __name__ == "__main__":
     NUM_CANDIDATES = 50       # Images to screen as potential patches (level 0)
     NUM_TARGETS = 200         # Separate pool to search for matches (level 0)
     CLASSIFIER_THRESHOLD = 0.3
+    MATCH_THRESHOLD = 0.4     # Min template match score to accept a match
     MAX_ACCEPTED = 10         # Keep top N most-recognizable patches (level 0)
     TOP_K_MATCHES = 3         # Matches to display per patch (level 0)
 
@@ -497,6 +501,7 @@ if __name__ == "__main__":
     print(f"  Candidates: {NUM_CANDIDATES} + {RECURSION_DEPTH}x{CANDIDATES_PER_LEVEL}")
     print(f"  Targets: {NUM_TARGETS}")
     print(f"  Classifier threshold: {CLASSIFIER_THRESHOLD}")
+    print(f"  Match threshold: {MATCH_THRESHOLD}")
     print(f"  Recursion depth: {RECURSION_DEPTH}")
     print(f"  CUDA: {CUDA_AVAILABLE}")
     print()
@@ -565,8 +570,20 @@ if __name__ == "__main__":
         num_threads_matching=NUM_THREADS_MATCHING,
         early_stop_threshold=EARLY_STOP_THRESHOLD,
         top_k=TOP_K_MATCHES,
+        match_threshold=MATCH_THRESHOLD,
     )
     search_patches(accepted, targets_processed, config)
+
+    # Drop patches that got no matches above threshold
+    before = len(accepted)
+    accepted = [p for p in accepted if p.get('matches')]
+    if before != len(accepted):
+        print(f"\n{before - len(accepted)} patches dropped (no match >= {MATCH_THRESHOLD})")
+        print(f"{len(accepted)} patches remaining")
+
+    if not accepted:
+        print("No patches with matches above threshold. Lower MATCH_THRESHOLD or add more targets.")
+        exit(0)
 
     # Level-0 visualization
     summary_path = os.path.join(OUTPUT_DIR, "level0_results.png")

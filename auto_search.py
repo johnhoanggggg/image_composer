@@ -304,7 +304,7 @@ def visualize_summary(accepted, blend_mode, alpha, output_path):
             )
             axes[r, col].imshow(composite)
             axes[r, col].set_title(
-                f"{match['class_name']}\n{match['score']:.3f} ({match['transform']})",
+                f"{match['class_name']}\n{match['score']:.3f} s={match['scale']:.2f} ({match['transform']})",
                 fontsize=7
             )
             axes[r, col].axis("off")

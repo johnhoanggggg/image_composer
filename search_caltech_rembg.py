@@ -650,15 +650,6 @@ def _apply_transform(img, transform):
             M[0, 2] += (new_w - w) / 2
             M[1, 2] += (new_h - h) / 2
             result = cv2.warpAffine(result, M, (new_w, new_h))
-            # Crop to tight bounding box of rotated content, matching
-            # the crop done in get_patch_variants so scale/position align
-            content_mask = cv2.warpAffine(
-                np.ones((h, w), dtype=np.uint8) * 255, M, (new_w, new_h)
-            )
-            coords = cv2.findNonZero(content_mask)
-            if coords is not None:
-                rx, ry, rw, rh = cv2.boundingRect(coords)
-                result = result[ry:ry+rh, rx:rx+rw]
 
     return result
 
@@ -690,6 +681,23 @@ def visualize_results(patch, patch_outline, results, patch_fg_mask=None,
 
         patch_transformed = _apply_transform(patch, transform)
         mask_transformed = _apply_transform(patch_fg_mask, transform) if patch_fg_mask is not None else None
+
+        # For arbitrary rotations, get_patch_variants crops the rotated
+        # outline to its tight bbox (removing padding).  The match
+        # scale/position are relative to those cropped dimensions.
+        # Replicate that crop here using the foreground mask so the
+        # composite lines up.  Cardinal rotations (0/90/180/270) don't
+        # crop during matching so we must NOT crop them here either.
+        if mask_transformed is not None and 'rot' in transform:
+            rot_part = transform.split('_')[0] if '_' in transform else transform
+            if rot_part.startswith('rot') and rot_part not in ('rot90', 'rot180', 'rot270'):
+                mask_binary = (mask_transformed > 0.1 if mask_transformed.dtype == np.float32
+                               else mask_transformed > 25).astype(np.uint8) * 255
+                coords = cv2.findNonZero(mask_binary)
+                if coords is not None:
+                    rx, ry, rw, rh = cv2.boundingRect(coords)
+                    patch_transformed = patch_transformed[ry:ry+rh, rx:rx+rw]
+                    mask_transformed = mask_transformed[ry:ry+rh, rx:rx+rw]
 
         image_vis = create_composite(patch_transformed, image, x, y, scale,
                                      blend_mode, alpha, patch_mask=mask_transformed)

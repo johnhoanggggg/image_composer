@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Auto-search: find recognizable Caltech101 images and match them against the dataset.
+Auto-search with recursion: find recognizable Caltech101 images, match them,
+then recursively layer more patches on top for increasingly chaotic composites.
 
 Pipeline:
-  1. Samples candidate images from Caltech101
-  2. Removes background with rembg, classifies each — keeps recognizable subjects
-  3. Uses each accepted image (whole, not cropped) as a patch and searches
-     a separate target pool for outline matches via template matching
-  4. Visualizes all results in a summary figure
+  1. Samples candidate images from Caltech101, removes background, classifies
+  2. Accepted images become patches, matched against a target pool (level 0)
+  3. Creates initial composite canvases from best matches
+  4. For each recursion level:
+     - Samples fresh candidates from unused portion of dataset
+     - Classifies after bg removal, keeps recognizable ones
+     - Precomputes their outlines + variants once
+     - Matches every new patch against each canvas, picks the best per canvas
+     - Layers the winning patch on top -> canvas gets more chaotic
+  5. Visualizes level-0 results + evolution strip per canvas
 
 Press Play in VS Code to run with the config at the bottom.
 """
@@ -40,7 +46,7 @@ from extract_patches import get_classifier, _INPUT_SIZE
 
 
 # ============================================================
-# CLASSIFICATION
+# HELPERS
 # ============================================================
 
 def classify_image(model, img_rgb):
@@ -63,6 +69,42 @@ def composite_fg_on_white(img_rgb, fg_mask):
         + white * (1.0 - fg_mask[..., None])
     )
     return blended.astype(np.uint8)
+
+
+def make_composite(patch_img, fg_mask, target_img, match_result, blend_mode, alpha):
+    """Composite a patch onto a target, handling transforms and arbitrary rotation crop."""
+    transform = match_result['transform']
+    x, y, scale = match_result['x'], match_result['y'], match_result['scale']
+
+    patch_t = _apply_transform(patch_img, transform)
+    mask_t = _apply_transform(fg_mask, transform) if fg_mask is not None else None
+
+    # Crop tight bbox for arbitrary (non-cardinal) rotations
+    if mask_t is not None and 'rot' in transform:
+        rot_part = transform.split('_')[0] if '_' in transform else transform
+        if rot_part.startswith('rot') and rot_part not in ('rot90', 'rot180', 'rot270'):
+            mask_binary = (mask_t > 0.1 if mask_t.dtype == np.float32
+                           else mask_t > 25).astype(np.uint8) * 255
+            coords = cv2.findNonZero(mask_binary)
+            if coords is not None:
+                rx, ry, rw, rh = cv2.boundingRect(coords)
+                patch_t = patch_t[ry:ry+rh, rx:rx+rw]
+                mask_t = mask_t[ry:ry+rh, rx:rx+rw]
+
+    return create_composite(patch_t, target_img, x, y, scale,
+                            blend_mode, alpha, patch_mask=mask_t)
+
+
+def outline_from_image(img_rgb, label, max_resolution):
+    """Compute an outline dict from a raw image (same shape as precompute_outlines returns)."""
+    img_proc, img_scale = resize_to_max(img_rgb, max_resolution)
+    outline = get_subject_outline_neural(img_proc)
+    return {
+        'image': img_rgb,
+        'outline': outline,
+        'img_scale': img_scale,
+        'class_name': label,
+    }
 
 
 # ============================================================
@@ -146,11 +188,101 @@ def search_patches(accepted, targets_processed, config):
 
 
 # ============================================================
+# RECURSION
+# ============================================================
+
+def build_canvases(accepted, blend_mode, alpha):
+    """Create initial composite canvases from level-0 best matches."""
+    canvases = []
+    for patch_info in accepted:
+        if not patch_info.get('matches'):
+            continue
+        best = patch_info['matches'][0]
+        composite = make_composite(
+            patch_info['image'], patch_info['fg_mask'],
+            best['image'], best, blend_mode, alpha
+        )
+        canvases.append({
+            'image': composite,
+            'label': f"{patch_info['class_name']}+{best['class_name']}",
+            # history[0] = bare target, history[1] = after level 0
+            'history': [best['image'].copy(), composite.copy()],
+        })
+    return canvases
+
+
+def prepare_patch_data(accepted_patches, config):
+    """Precompute outlines and variants for accepted patches (done once, reused per canvas)."""
+    patch_data = []
+    for p in accepted_patches:
+        patch_proc, patch_scale = resize_to_max(p['image'], config['max_resolution'])
+        outline = get_subject_outline_neural(patch_proc)
+        variants = get_patch_variants(
+            patch_proc, outline,
+            config['allow_flip'], config['allow_rotation'], config['rotation_steps']
+        )
+        patch_data.append({
+            'patch_info': p,
+            'variants': variants,
+            'patch_scale': patch_scale,
+        })
+    return patch_data
+
+
+def recurse_level(canvases, new_accepted, config, blend_mode, alpha):
+    """One recursion level: match new patches against canvases, composite the best onto each."""
+    if not new_accepted:
+        return
+
+    # Precompute outlines + variants for new patches once
+    print(f"  Precomputing outlines for {len(new_accepted)} new patches...")
+    patch_data = prepare_patch_data(new_accepted, config)
+
+    # Compute outlines for current canvases
+    print(f"  Computing outlines for {len(canvases)} canvases...")
+    canvas_processed = [
+        outline_from_image(c['image'], c['label'], config['max_resolution'])
+        for c in canvases
+    ]
+
+    # For each canvas, try every new patch and keep the best
+    for c_idx, canvas in enumerate(canvases):
+        target = [canvas_processed[c_idx]]  # single-element list for match_all_images
+        best_score = -1
+        best_result = None
+        best_patch_info = None
+
+        for pd in patch_data:
+            results = match_all_images(
+                target, pd['variants'],
+                config['min_scale'], config['max_scale'], config['scale_steps'],
+                pd['patch_scale'], 1,  # 1 thread — single target
+                config['early_stop_threshold'], config['max_resolution']
+            )
+            if results and results[0]['score'] > best_score:
+                best_score = results[0]['score']
+                best_result = results[0]
+                best_patch_info = pd['patch_info']
+
+        if best_result and best_patch_info:
+            composite = make_composite(
+                best_patch_info['image'], best_patch_info['fg_mask'],
+                canvas['image'], best_result, blend_mode, alpha
+            )
+            canvas['image'] = composite
+            canvas['label'] += f"+{best_patch_info['class_name']}"
+            canvas['history'].append(composite.copy())
+            print(f"    Canvas {c_idx}: +{best_patch_info['class_name']} (score={best_score:.3f})")
+        else:
+            print(f"    Canvas {c_idx}: no match found")
+
+
+# ============================================================
 # VISUALIZATION
 # ============================================================
 
 def visualize_summary(accepted, blend_mode, alpha, output_path):
-    """Summary figure: each row = one accepted patch, columns = original | bg-removed | top matches."""
+    """Level-0 summary: each row = one patch, columns = original | bg-removed | matches."""
     patches_with_matches = [p for p in accepted if p.get('matches')]
     if not patches_with_matches:
         print("No matches to visualize.")
@@ -169,7 +301,6 @@ def visualize_summary(accepted, blend_mode, alpha, output_path):
         axes[0, c].set_title(title, fontsize=10, weight='bold')
 
     for r, patch_info in enumerate(patches_with_matches):
-        # Col 0: original image
         axes[r, 0].imshow(patch_info['image'])
         axes[r, 0].set_ylabel(
             f"{patch_info['class_name']}\n{patch_info['clf_label']} ({patch_info['clf_score']:.2f})",
@@ -177,44 +308,22 @@ def visualize_summary(accepted, blend_mode, alpha, output_path):
         )
         axes[r, 0].axis("off")
 
-        # Col 1: bg removed (fg on white)
         axes[r, 1].imshow(patch_info['fg_on_white'])
         axes[r, 1].axis("off")
 
-        # Cols 2+: match composites
         for j, match in enumerate(patch_info['matches']):
             col = 2 + j
-            image = match['image']
-            x, y, scale = match['x'], match['y'], match['scale']
-            transform = match['transform']
-
-            patch_t = _apply_transform(patch_info['image'], transform)
-            fg_mask = patch_info['fg_mask']
-            mask_t = _apply_transform(fg_mask, transform) if fg_mask is not None else None
-
-            # Crop for arbitrary rotations (same logic as visualize_results)
-            if mask_t is not None and 'rot' in transform:
-                rot_part = transform.split('_')[0] if '_' in transform else transform
-                if rot_part.startswith('rot') and rot_part not in ('rot90', 'rot180', 'rot270'):
-                    mask_binary = (mask_t > 0.1 if mask_t.dtype == np.float32
-                                   else mask_t > 25).astype(np.uint8) * 255
-                    coords = cv2.findNonZero(mask_binary)
-                    if coords is not None:
-                        rx, ry, rw, rh = cv2.boundingRect(coords)
-                        patch_t = patch_t[ry:ry+rh, rx:rx+rw]
-                        mask_t = mask_t[ry:ry+rh, rx:rx+rw]
-
-            composite = create_composite(
-                patch_t, image, x, y, scale, blend_mode, alpha, patch_mask=mask_t
+            composite = make_composite(
+                patch_info['image'], patch_info['fg_mask'],
+                match['image'], match, blend_mode, alpha
             )
             axes[r, col].imshow(composite)
             axes[r, col].set_title(
-                f"{match['class_name']}\n{match['score']:.3f} ({transform})",
+                f"{match['class_name']}\n{match['score']:.3f} ({match['transform']})",
                 fontsize=7
             )
             axes[r, col].axis("off")
 
-        # Hide empty match columns
         for j in range(len(patch_info['matches']), top_k):
             axes[r, 2 + j].axis("off")
 
@@ -224,8 +333,43 @@ def visualize_summary(accepted, blend_mode, alpha, output_path):
     plt.show()
 
 
+def visualize_evolution(canvases, output_path):
+    """Show each canvas progressing through recursion levels (one row per canvas)."""
+    if not canvases:
+        return
+
+    max_levels = max(len(c['history']) for c in canvases)
+    rows = len(canvases)
+    cols = max_levels
+
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    if rows == 1:
+        axes = axes[np.newaxis, :]
+    if cols == 1:
+        axes = axes[:, np.newaxis]
+
+    for c in range(cols):
+        label = "Original target" if c == 0 else f"+ Level {c}"
+        axes[0, c].set_title(label, fontsize=10, weight='bold')
+
+    for r, canvas in enumerate(canvases):
+        short_label = canvas['label'].split('+')[0]
+        axes[r, 0].set_ylabel(short_label, fontsize=8, rotation=0, labelpad=60, va='center')
+        for c, snapshot in enumerate(canvas['history']):
+            axes[r, c].imshow(snapshot)
+            axes[r, c].axis("off")
+        for c in range(len(canvas['history']), cols):
+            axes[r, c].axis("off")
+
+    plt.suptitle("Recursive Compositing Evolution", fontsize=14, weight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Evolution saved: {output_path}")
+    plt.show()
+
+
 def visualize_debug(accepted, output_path):
-    """Debug: show patch outline, best-match target outline, and red/blue overlay per patch."""
+    """Debug: outline overlay for level-0 matches."""
     patches_with_matches = [p for p in accepted if p.get('matches')]
     if not patches_with_matches:
         return
@@ -248,7 +392,6 @@ def visualize_debug(accepted, output_path):
         x_proc = int(best['x'] * img_scale)
         y_proc = int(best['y'] * img_scale)
 
-        # Col 0: patch outline variant
         axes[r, 0].imshow(outline_var, cmap='gray')
         axes[r, 0].set_ylabel(
             f"{patch_info['class_name']}\n-> {best['class_name']}",
@@ -256,11 +399,9 @@ def visualize_debug(accepted, output_path):
         )
         axes[r, 0].axis("off")
 
-        # Col 1: target outline
         axes[r, 1].imshow(target_outline, cmap='gray')
         axes[r, 1].axis("off")
 
-        # Col 2: overlay
         th, tw = target_outline.shape[:2]
         ph, pw = outline_var.shape[:2]
         new_w = int(pw * match_scale)
@@ -279,7 +420,7 @@ def visualize_debug(accepted, output_path):
                 overlay[y1:y2, x1:x2, 0] = np.maximum(
                     overlay[y1:y2, x1:x2, 0],
                     patch_scaled[py1:py2, px1:px2]
-                )  # red = patch
+                )
 
         axes[r, 2].imshow(overlay)
         axes[r, 2].set_title(
@@ -300,11 +441,16 @@ def visualize_debug(accepted, output_path):
 if __name__ == "__main__":
     OUTPUT_DIR = "auto_search_output"
 
-    NUM_CANDIDATES = 50       # Images to screen as potential patches
-    NUM_TARGETS = 200         # Separate pool to search through for matches
+    NUM_CANDIDATES = 50       # Images to screen as potential patches (level 0)
+    NUM_TARGETS = 200         # Separate pool to search for matches (level 0)
     CLASSIFIER_THRESHOLD = 0.3
-    MAX_ACCEPTED = 10         # Keep top N most-recognizable patches
-    TOP_K_MATCHES = 3         # Matches to display per patch
+    MAX_ACCEPTED = 10         # Keep top N most-recognizable patches (level 0)
+    TOP_K_MATCHES = 3         # Matches to display per patch (level 0)
+
+    # Recursion — layer additional patches onto canvases
+    RECURSION_DEPTH = 2               # 0 = no recursion, N = N extra layers per canvas
+    CANDIDATES_PER_LEVEL = 30         # Fresh candidates sampled at each recursion level
+    MAX_ACCEPTED_PER_LEVEL = 5        # Best new patches to try per level
 
     # Template matching
     MIN_SCALE = 0.1
@@ -333,7 +479,9 @@ if __name__ == "__main__":
         NUM_TARGETS = 20
         MAX_ACCEPTED = 3
         TOP_K_MATCHES = 2
-        # Clear output folder
+        RECURSION_DEPTH = 1
+        CANDIDATES_PER_LEVEL = 8
+        MAX_ACCEPTED_PER_LEVEL = 3
         if os.path.isdir(OUTPUT_DIR):
             for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
                 os.remove(f)
@@ -346,15 +494,15 @@ if __name__ == "__main__":
         exit(1)
 
     print("Configuration:")
-    print(f"  Candidates: {NUM_CANDIDATES}  |  Targets: {NUM_TARGETS}")
+    print(f"  Candidates: {NUM_CANDIDATES} + {RECURSION_DEPTH}x{CANDIDATES_PER_LEVEL}")
+    print(f"  Targets: {NUM_TARGETS}")
     print(f"  Classifier threshold: {CLASSIFIER_THRESHOLD}")
-    print(f"  Max accepted patches: {MAX_ACCEPTED}")
-    print(f"  Top matches per patch: {TOP_K_MATCHES}")
+    print(f"  Recursion depth: {RECURSION_DEPTH}")
     print(f"  CUDA: {CUDA_AVAILABLE}")
     print()
 
     # ----------------------------------------------------------
-    # Load dataset and split into candidates vs targets
+    # Load dataset and allocate index ranges
     # ----------------------------------------------------------
     print("Loading Caltech101 dataset...")
     ds, info = tfds.load("caltech101", split="train", with_info=True, shuffle_files=True)
@@ -363,8 +511,12 @@ if __name__ == "__main__":
 
     all_indices = list(range(len(ds_list)))
     random.shuffle(all_indices)
-    candidate_indices = all_indices[:NUM_CANDIDATES]
-    target_indices = all_indices[NUM_CANDIDATES:NUM_CANDIDATES + NUM_TARGETS]
+
+    idx_offset = 0
+    candidate_indices = all_indices[idx_offset:idx_offset + NUM_CANDIDATES]
+    idx_offset += NUM_CANDIDATES
+    target_indices = all_indices[idx_offset:idx_offset + NUM_TARGETS]
+    idx_offset += NUM_TARGETS
 
     candidates = [ds_list[i] for i in candidate_indices]
     targets = [ds_list[i] for i in target_indices]
@@ -382,7 +534,6 @@ if __name__ == "__main__":
         print("No recognizable patches found. Try lowering CLASSIFIER_THRESHOLD.")
         exit(0)
 
-    # Keep the top MAX_ACCEPTED by classifier confidence
     accepted.sort(key=lambda p: p['clf_score'], reverse=True)
     accepted = accepted[:MAX_ACCEPTED]
     print(f"Using top {len(accepted)} patches\n")
@@ -405,7 +556,7 @@ if __name__ == "__main__":
     )
 
     # ----------------------------------------------------------
-    # Step 3: search each accepted patch
+    # Step 3: level-0 search
     # ----------------------------------------------------------
     config = dict(
         min_scale=MIN_SCALE, max_scale=MAX_SCALE, scale_steps=SCALE_STEPS,
@@ -417,20 +568,66 @@ if __name__ == "__main__":
     )
     search_patches(accepted, targets_processed, config)
 
-    # ----------------------------------------------------------
-    # Step 4: visualize
-    # ----------------------------------------------------------
-    summary_path = os.path.join(OUTPUT_DIR, "auto_search_results.png")
+    # Level-0 visualization
+    summary_path = os.path.join(OUTPUT_DIR, "level0_results.png")
     visualize_summary(accepted, BLEND_MODE, ALPHA, summary_path)
 
     if DEBUG_MODE:
-        debug_path = os.path.join(OUTPUT_DIR, "auto_search_debug_outlines.png")
+        debug_path = os.path.join(OUTPUT_DIR, "level0_debug_outlines.png")
         visualize_debug(accepted, debug_path)
+
+    # ----------------------------------------------------------
+    # Step 4: build canvases and recurse
+    # ----------------------------------------------------------
+    canvases = None
+    if RECURSION_DEPTH > 0:
+        canvases = build_canvases(accepted, BLEND_MODE, ALPHA)
+        print(f"\nBuilt {len(canvases)} canvases for recursion\n")
+
+        for level in range(RECURSION_DEPTH):
+            print(f"{'='*60}")
+            print(f"RECURSION LEVEL {level+1}/{RECURSION_DEPTH}")
+            print(f"{'='*60}")
+
+            # Consume fresh indices from the shuffled pool
+            new_indices = all_indices[idx_offset:idx_offset + CANDIDATES_PER_LEVEL]
+            idx_offset += CANDIDATES_PER_LEVEL
+
+            if not new_indices:
+                print("Dataset exhausted, stopping recursion.")
+                break
+
+            new_candidates = [ds_list[i] for i in new_indices]
+            print(f"Classifying {len(new_candidates)} new candidates...")
+            new_accepted = find_recognizable(
+                new_candidates, label_names, model, CLASSIFIER_THRESHOLD
+            )
+            print(f"  {len(new_accepted)} passed threshold")
+
+            new_accepted.sort(key=lambda p: p['clf_score'], reverse=True)
+            new_accepted = new_accepted[:MAX_ACCEPTED_PER_LEVEL]
+
+            if not new_accepted:
+                print("No recognizable patches at this level, stopping.")
+                break
+
+            print(f"  Using top {len(new_accepted)} patches")
+            recurse_level(canvases, new_accepted, config, BLEND_MODE, ALPHA)
+
+        # Evolution visualization
+        evo_path = os.path.join(OUTPUT_DIR, "evolution.png")
+        visualize_evolution(canvases, evo_path)
+
+        # Save final chaotic images
+        for i, canvas in enumerate(canvases):
+            final_path = os.path.join(OUTPUT_DIR, f"chaos_{i:02d}.png")
+            cv2.imwrite(final_path, cv2.cvtColor(canvas['image'], cv2.COLOR_RGB2BGR))
+        print(f"\nSaved {len(canvases)} final chaotic images to {OUTPUT_DIR}/")
 
     # ----------------------------------------------------------
     # Print summary
     # ----------------------------------------------------------
-    print(f"\nSummary:")
+    print(f"\nFinal Summary:")
     for i, p in enumerate(accepted):
         matches = p.get('matches', [])
         if matches:
@@ -440,4 +637,12 @@ if __name__ == "__main__":
                 f" -> {best['class_name']} (score={best['score']:.3f})"
             )
         else:
-            print(f"  {i+1}. {p['class_name']} ({p['clf_label']} {p['clf_score']:.2f}) -> no match")
+            print(
+                f"  {i+1}. {p['class_name']} ({p['clf_label']} {p['clf_score']:.2f})"
+                f" -> no match"
+            )
+
+    if canvases:
+        print(f"\nCanvases after {RECURSION_DEPTH} recursion levels:")
+        for i, c in enumerate(canvases):
+            print(f"  {i}. {c['label']}  ({len(c['history'])} snapshots)")

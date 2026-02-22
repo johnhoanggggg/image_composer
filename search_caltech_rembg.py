@@ -296,8 +296,12 @@ def _refine_at_full_res(patch_outline, target_outline, scales, ph, pw, th, tw, t
     return best_result
 
 
-def match_outlines(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, scale_steps=20):
+def match_outlines(patch_outline, target_outline, min_scale=0.1, max_scale=0.9, scale_steps=20):
     """Pyramid 4x matching: coarse pass at 1/4 resolution, refine top scales at full res.
+
+    Scales are expressed as fractions of the target's longer side, not as
+    multipliers on the patch.  e.g. min_scale=0.1 means the patch's longer
+    side will be at least 10% of the target's longer side.
 
     1. Downsample both outlines by 4x
     2. Run template matching at all scales on the small images (very fast)
@@ -306,6 +310,14 @@ def match_outlines(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, 
     """
     ph, pw = patch_outline.shape[:2]
     th, tw = target_outline.shape[:2]
+
+    # Convert target-relative scales to patch multipliers
+    target_max = max(th, tw)
+    patch_max = max(ph, pw)
+    if patch_max == 0:
+        return (0, 0, 1.0, -1)
+    internal_min = min_scale * target_max / patch_max
+    internal_max = max_scale * target_max / patch_max
 
     # --- Level 1: Downsample by 4x ---
     ds = 4
@@ -320,7 +332,7 @@ def match_outlines(patch_outline, target_outline, min_scale=0.3, max_scale=2.0, 
     ph_s, pw_s = patch_small.shape[:2]
     th_s, tw_s = target_small.shape[:2]
 
-    scales = np.linspace(min_scale, max_scale, scale_steps)
+    scales = np.linspace(internal_min, internal_max, scale_steps)
 
     # Coarse pass at low resolution — sweep all scales cheaply
     coarse_results = []
@@ -564,7 +576,7 @@ def _get_patch_fg_mask(img):
 
 
 def search_dataset(patch_path, num_samples=200, top_k=5,
-                   min_scale=0.3, max_scale=2.0, scale_steps=20,
+                   min_scale=0.1, max_scale=0.9, scale_steps=20,
                    allow_flip=True, allow_rotation=False, rotation_steps=4,
                    max_resolution=320, num_threads_segmentation=1, num_threads_matching=4,
                    early_stop_threshold=0.95):
@@ -728,7 +740,7 @@ if __name__ == "__main__":
     OUTPUT_PATH = "search_results.png"
     
     MIN_SCALE = 0.1
-    MAX_SCALE = 2.0
+    MAX_SCALE = 0.9
     SCALE_STEPS = 20
     BLEND_MODE = "replace"
     ALPHA = 1

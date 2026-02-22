@@ -656,29 +656,42 @@ def _apply_transform(img, transform):
 
 def visualize_results(patch, patch_outline, results, patch_fg_mask=None,
                       blend_mode='soft', alpha=0.9, output_path="search_results.png"):
-    """Visualize top matches as overlaid patches on target images only."""
+    """Visualize top matches as overlaid patches on target images in a square grid."""
+    import math
     n = len(results)
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
 
-    if n == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
+
+    # Normalize axes to 2D array for uniform indexing
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes[np.newaxis, :]
+    elif cols == 1:
+        axes = axes[:, np.newaxis]
 
     for i, result in enumerate(results):
+        r, c = divmod(i, cols)
         image = result['image']
         x, y, scale, score = result['x'], result['y'], result['scale'], result['score']
         class_name = result['class_name']
         transform = result['transform']
 
-        # Apply same transform to both patch and its mask
         patch_transformed = _apply_transform(patch, transform)
         mask_transformed = _apply_transform(patch_fg_mask, transform) if patch_fg_mask is not None else None
 
-        # Composite patch onto target
         image_vis = create_composite(patch_transformed, image, x, y, scale,
                                      blend_mode, alpha, patch_mask=mask_transformed)
-        axes[i].imshow(image_vis)
-        axes[i].set_title(f"#{i+1}: {class_name}\nScore: {score:.3f} ({transform})")
-        axes[i].axis("off")
+        axes[r, c].imshow(image_vis)
+        axes[r, c].set_title(f"#{i+1}: {class_name}\n{score:.3f} ({transform})", fontsize=8)
+        axes[r, c].axis("off")
+
+    # Hide empty cells
+    for i in range(n, rows * cols):
+        r, c = divmod(i, cols)
+        axes[r, c].axis("off")
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')

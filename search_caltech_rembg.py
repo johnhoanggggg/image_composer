@@ -650,6 +650,15 @@ def _apply_transform(img, transform):
             M[0, 2] += (new_w - w) / 2
             M[1, 2] += (new_h - h) / 2
             result = cv2.warpAffine(result, M, (new_w, new_h))
+            # Crop to tight bounding box of rotated content, matching
+            # the crop done in get_patch_variants so scale/position align
+            content_mask = cv2.warpAffine(
+                np.ones((h, w), dtype=np.uint8) * 255, M, (new_w, new_h)
+            )
+            coords = cv2.findNonZero(content_mask)
+            if coords is not None:
+                rx, ry, rw, rh = cv2.boundingRect(coords)
+                result = result[ry:ry+rh, rx:rx+rw]
 
     return result
 

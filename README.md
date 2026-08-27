@@ -4,10 +4,15 @@ Build an animal out of photographs of other objects.
 
 ![A duck composed of a hedgehog, a flower, a crab and a church](examples/duck3_strip.png)
 
-The animal photo is the canvas. Each round, every object in a pool is scored
-against the animal's contours and the best-fitting one is composited on top,
-clipped to the animal's silhouette. After four rounds the duck above is a
-hedgehog, a flower petal, a crab and a church — and still reads as a duck.
+The photo is the canvas. Each round, every object in a pool is scored against
+the canvas's contours and the best-fitting one is composited on top, clipped to
+the subject's silhouette. After four rounds the duck above is a hedgehog, a
+flower petal, a crab and a church — and still reads as a duck.
+
+It does not have to be an animal. A revolver built from a tree sparrow, a
+guitar whose body is a stop sign, a Windsor chair striped out of a bulldog:
+
+![Twelve objects rebuilt from other objects](examples/gallery.png)
 
 ## Install
 

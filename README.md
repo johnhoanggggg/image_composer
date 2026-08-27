@@ -9,10 +9,16 @@ the canvas's contours and the best-fitting one is composited on top — whole, n
 cut to the outline underneath. Objects run past the edge they were matched to,
 and that overhang is the point: the subject still reads, but the seams show.
 
-It does not have to be an animal. A revolver built from a tree sparrow, a
-guitar whose body is a stop sign, a Windsor chair striped out of a bulldog:
+It does not have to be an animal. A revolver built from a tree sparrow, a pair
+of scissors turned into a revolver, a Windsor chair striped out of a horse:
 
-![Twelve objects rebuilt from other objects](examples/gallery.png)
+![Eighteen objects rebuilt from other objects](examples/gallery.png)
+
+`make_gallery.py` also writes step sheets, one row per composition and one
+column per object as it lands — the finished picture hides the order things
+arrived in:
+
+![Each object as it lands](examples/steps.png)
 
 ## Install
 

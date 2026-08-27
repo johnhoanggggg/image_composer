@@ -1,7 +1,13 @@
-matplotlib==3.10.8
-numpy==1.26.3
-opencv_python==4.11.0.86
-opencv_python_headless==4.11.0.86
-tensorflow_datasets==4.9.9
-scipy>=1.11.0
-tqdm==4.67.1
+# Core pipeline
+numpy>=1.26
+opencv-python-headless>=4.11
+pillow>=10.0
+matplotlib>=3.8
+tqdm>=4.67
+
+# Neural background removal (pulls in onnxruntime).
+# Use rembg[gpu] instead if you have CUDA.
+rembg[cpu]>=2.0.60
+
+# Optional: only needed for --source imagenet, which streams from HuggingFace.
+# datasets>=2.19

@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+.venv/
+output/
+search_output/
+saved_*.png

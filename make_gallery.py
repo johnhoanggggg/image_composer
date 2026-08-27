@@ -14,6 +14,7 @@ quality, so the gallery is not full of pictures the segmenter could not cut.
 """
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -93,7 +94,7 @@ def pick_canvases(count, max_resolution, seed=0, scan=6):
                 best = (score, path)
         if best:
             print(f"  {category:<18} quality={best[0]:.2f}")
-            chosen.append(best[1])
+            chosen.append((best[1], category))
     return chosen
 
 
@@ -175,7 +176,7 @@ def main(argv=None):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    canvases = args.canvas
+    canvases = [(c, os.path.splitext(os.path.basename(c))[0]) for c in args.canvas]
     if not canvases:
         canvases = pick_canvases(args.count, args.max_resolution, args.seed)
     if not canvases:
@@ -201,22 +202,36 @@ def main(argv=None):
     print(f"  {sum(len(v) for v in variants)} variants\n")
 
     entries = []
-    for i, path in enumerate(canvases, 1):
-        name = os.path.splitext(os.path.basename(path))[0]
-        print(f"\n{'#' * 60}\n# [{i}/{len(canvases)}] {name}\n{'#' * 60}")
+    manifest = []
+    for i, (path, label) in enumerate(canvases, 1):
+        # Unique per composition even when two canvases share a filename.
+        name = f"{label}_{os.path.splitext(os.path.basename(path))[0]}"
+        name = name.replace(os.sep, "_").replace(" ", "_")
+        print(f"\n{'#' * 60}\n# [{i}/{len(canvases)}] {label}\n{'#' * 60}")
         try:
             image, _history, placed = compose(
                 path, objects, config, rounds=args.rounds,
                 output_dir=args.output_dir, save_steps=False,
-                threads=args.threads, variant_cache=variants)
+                threads=args.threads, variant_cache=variants, name=name)
         except Exception as exc:
             print(f"  ! failed: {type(exc).__name__}: {exc}")
             continue
         if placed:
-            entries.append((name, image, placed))
+            entries.append((label, image, placed))
+            manifest.append({
+                "name": name,
+                "label": label,
+                "canvas": os.path.abspath(path),
+                "composed": os.path.join(args.output_dir, f"{name}_composed.png"),
+                "placed": [{"class_name": p["class_name"], "source": p["source"],
+                            "score": round(float(p["score"]), 4)} for p in placed],
+            })
 
     if not entries:
         raise SystemExit("Nothing composed.")
+
+    with open(os.path.join(args.output_dir, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=1)
 
     contact_sheet(entries, os.path.join(args.output_dir, "contact_sheet.png"),
                   columns=args.columns)

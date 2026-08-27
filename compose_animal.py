@@ -127,13 +127,16 @@ def place_object(canvas, obj, result, blend_mode, alpha, clip_mask=None):
 def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
             alpha=1.0, output_dir="output", save_steps=True, threads=4,
             clip_to_animal=True, allow_repeat_class=False,
-            variant_cache=None):
+            variant_cache=None, name=None):
     """Layer `rounds` objects onto the animal, best fit first."""
     animal_bgr = cv2.imread(animal_path, cv2.IMREAD_COLOR)
     if animal_bgr is None:
         raise SystemExit(f"Could not read animal image: {animal_path}")
     canvas = cv2.cvtColor(animal_bgr, cv2.COLOR_BGR2RGB)
-    animal_name = os.path.splitext(os.path.basename(animal_path))[0]
+    # Callers composing a batch pass an explicit name: dataset filenames repeat
+    # across categories (every Caltech101 category has an image_0001.jpg), so
+    # naming outputs after the file alone lets one composition overwrite another.
+    animal_name = name or os.path.splitext(os.path.basename(animal_path))[0]
 
     # The animal's own silhouette, fixed once. Later rounds must keep matching
     # against the animal, not against the collage growing on top of it.

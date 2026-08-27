@@ -335,7 +335,7 @@ def parse_args(argv):
     p.add_argument("--rank-top-k", type=int, default=15,
                    help="objects promoted from the coarse ranking pass to "
                         "full-resolution matching each round")
-    p.add_argument("--min-containment", type=float, default=0.85,
+    p.add_argument("--min-containment", type=float, default=0.70,
                    help="fraction of each object that must land inside the "
                         "subject's outline; the remainder is the overhang")
     p.add_argument("--max-overlap", type=float, default=0.35,

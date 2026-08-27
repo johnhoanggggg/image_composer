@@ -32,6 +32,10 @@ W_PRECISION = 0.30   # patch edges land on target edges
 W_RECALL = 0.50      # target contour explained by the patch
 W_CONTAIN = 0.20     # patch body inside target subject
 
+# Absolute lower bound on an object's size, as a fraction of the subject, so
+# the free-area-relative gate above can never admit a speck.
+MIN_BODY_FLOOR = 0.03
+
 MIN_EDGE_PIXELS = 40
 MIN_TEMPLATE_SIDE = 12
 
@@ -52,7 +56,7 @@ class TargetContext:
 
     __slots__ = ("outline", "proximity", "edges_f", "edge_integral", "subject",
                  "subject_integral", "occupied", "occupied_integral",
-                 "shape", "edge_count", "subject_area", "_small")
+                 "shape", "edge_count", "subject_area", "free_area", "_small")
 
     def __init__(self, outline, subject_mask=None, occupied_mask=None, tau=6.0):
         self._small = {}
@@ -76,6 +80,7 @@ class TargetContext:
             occupied = (occupied_mask > 127).astype(np.float32)
         self.occupied = occupied
         self.occupied_integral = cv2.integral(occupied)
+        self.free_area = float((self.subject * (1.0 - occupied)).sum())
 
     def update_occupied(self, occupied_mask):
         """Swap in a new occupancy mask, keeping the expensive fields.
@@ -91,6 +96,7 @@ class TargetContext:
                                   interpolation=cv2.INTER_NEAREST)
         self.occupied = occupied
         self.occupied_integral = cv2.integral(occupied)
+        self.free_area = float((self.subject * (1.0 - occupied)).sum())
         for factor, small in self._small.items():
             small.occupied = (cv2.resize(
                 occupied, (small.shape[1], small.shape[0]),
@@ -129,11 +135,23 @@ def _score_at_scale(ctx, patch_outline, patch_body, scale, patch_dist=None,
         body_t = (body_t > 40).astype(np.float32)
         n_body = float(body_t.sum())
 
-        # Size gate: an object covering a sliver of the animal is not a
+        # Size gate: an object covering a sliver of the subject is not a
         # composition, it is a speck.  Reject the scale outright rather than
         # letting the score decide, so results stay legible.
+        #
+        # Measured against the area still uncovered, not the whole subject.
+        # Held against the whole subject it fights the containment and overlap
+        # gates once the first object lands: a later object then has to be a
+        # tenth of the subject, sit almost entirely inside it, and barely touch
+        # what is already there -- which on a thin shape nothing satisfies, so
+        # the round finds nothing and the composition stops at one object.
+        # Scaling it to the free area lets the first object be bold and later
+        # ones be details, with an absolute floor so nothing becomes a speck.
         if min_body_frac > 0 and ctx.subject_area > 0:
-            if n_body < min_body_frac * ctx.subject_area:
+            free = ctx.free_area if ctx.free_area > 0 else ctx.subject_area
+            required = max(min_body_frac * free,
+                           MIN_BODY_FLOOR * ctx.subject_area)
+            if n_body < required:
                 return None
 
     # Precision: mean proximity of this patch's edges to the target's edges.
@@ -309,6 +327,7 @@ def _downscale_context(ctx, factor):
                                  interpolation=cv2.INTER_AREA)
                       > 0.5).astype(np.float32)
     small.occupied_integral = cv2.integral(small.occupied)
+    small.free_area = float((small.subject * (1.0 - small.occupied)).sum())
     small._small = {}
     ctx._small[factor] = small
     return small

@@ -202,7 +202,7 @@ def parse_args(argv):
     p.add_argument("--rotation-steps", type=int, default=8)
     p.add_argument("--min-body-frac", type=float, default=0.10)
     p.add_argument("--max-overlap", type=float, default=0.35)
-    p.add_argument("--min-containment", type=float, default=0.85)
+    p.add_argument("--min-containment", type=float, default=0.70)
     p.add_argument("--overlap-penalty", type=float, default=0.35)
     p.add_argument("--min-score", type=float, default=0.22)
     p.add_argument("--rank-top-k", type=int, default=15)

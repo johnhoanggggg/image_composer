@@ -2,12 +2,12 @@
 
 Build an animal out of photographs of other objects.
 
-![A duck composed of a hedgehog, a flower, a crab and a church](examples/duck3_strip.png)
+![A duck composed of a flower, a barrel, a pigeon and a hedgehog](examples/duck3_strip.png)
 
 The photo is the canvas. Each round, every object in a pool is scored against
-the canvas's contours and the best-fitting one is composited on top, clipped to
-the subject's silhouette. After four rounds the duck above is a hedgehog, a
-flower petal, a crab and a church — and still reads as a duck.
+the canvas's contours and the best-fitting one is composited on top — whole, not
+cut to the outline underneath. Objects run past the edge they were matched to,
+and that overhang is the point: the subject still reads, but the seams show.
 
 It does not have to be an animal. A revolver built from a tree sparrow, a
 guitar whose body is a stop sign, a Windsor chair striped out of a bulldog:
@@ -38,7 +38,6 @@ Useful flags:
 | `--min-body-frac F` | each object must cover this much of the animal (keeps objects legible) |
 | `--max-overlap F` | reject a placement that buries this much of itself in earlier objects |
 | `--min-score F` | stop early rather than paste something that does not fit |
-| `--no-clip` | let objects spill outside the animal's silhouette |
 | `--rank-top-k N` | objects promoted from coarse ranking to full-resolution matching |
 
 ## Many images at once

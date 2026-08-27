@@ -83,7 +83,7 @@ def is_cardinal(transform):
     return rot[3:] in ("", "0", "90", "180", "270")
 
 
-def place_object(canvas, obj, result, blend_mode, alpha, clip_mask=None):
+def place_object(canvas, obj, result, blend_mode, alpha):
     """Composite the winning object onto the canvas at full resolution.
 
     The match ran on a downscaled, bbox-cropped copy, so the same crop and the
@@ -121,13 +121,12 @@ def place_object(canvas, obj, result, blend_mode, alpha, clip_mask=None):
 
     return composite(img, canvas, result["x"], result["y"], result["scale"],
                      blend_mode, alpha, patch_mask=alpha_mask,
-                     return_placed_mask=True, clip_mask=clip_mask)
+                     return_placed_mask=True)
 
 
 def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
             alpha=1.0, output_dir="output", save_steps=True, threads=4,
-            clip_to_animal=True, allow_repeat_class=False,
-            variant_cache=None, name=None):
+            allow_repeat_class=False, variant_cache=None, name=None):
     """Layer `rounds` objects onto the animal, best fit first."""
     animal_bgr = cv2.imread(animal_path, cv2.IMREAD_COLOR)
     if animal_bgr is None:
@@ -144,22 +143,19 @@ def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
     animal_mask = segment.foreground_mask(proc)
     # Keep the single largest blob.  subject_outline already traces only the
     # largest contour, so leaving every component in the subject mask made the
-    # two disagree: objects were scored against one animal and then clipped to
-    # a mask that also held background clutter, leaving slivers behind.
+    # containment term score against a different shape than the one the edges
+    # were matched to, which on a cluttered photo credits an object for
+    # covering background rather than subject.
     animal_subject = segment.largest_component(segment.clean_mask(animal_mask))
     animal_outline = segment.subject_outline(proc)
 
     describe_silhouette(animal_mask, animal_subject)
 
-    # Full-resolution copy of the same silhouette.  Clipping every paste to it
-    # is what stops an object from spilling across the background and burying
-    # the animal -- the failure mode where a well-scored watch simply covers
-    # the whole head.  The animal's outline survives no matter what lands on it.
-    animal_subject_full = cv2.resize(animal_subject,
-                                     (canvas.shape[1], canvas.shape[0]),
-                                     interpolation=cv2.INTER_NEAREST)
-    if clip_to_animal:
-        animal_subject_full = cv2.GaussianBlur(animal_subject_full, (5, 5), 0)
+    # Objects are deliberately not clipped to the subject's silhouette.  Cutting
+    # every paste to the outline underneath makes the canvas act as a stencil,
+    # and the result is too tidy: the overhang where an object runs past the
+    # edge it was matched to is the point.  Containment still steers placements
+    # onto the subject as a scoring term, it just no longer enforces them.
 
     occupied_full = np.zeros(canvas.shape[:2], np.uint8)
     history = [canvas.copy()]
@@ -251,9 +247,7 @@ def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
         result["y"] = int(round(result["y"] / img_scale))
         result["scale"] = result["match_scale"] * (obj["img_scale"] / img_scale)
 
-        canvas, placed_mask = place_object(
-            canvas, obj, result, blend_mode, alpha,
-            clip_mask=animal_subject_full if clip_to_animal else None)
+        canvas, placed_mask = place_object(canvas, obj, result, blend_mode, alpha)
         occupied_full = np.maximum(occupied_full, placed_mask)
         history.append(canvas.copy())
         placed.append({
@@ -344,8 +338,6 @@ def parse_args(argv):
                         "itself in already-placed objects")
     p.add_argument("--allow-repeat-class", action="store_true",
                    help="let the same object category win more than once")
-    p.add_argument("--no-clip", action="store_true",
-                   help="let objects spill outside the animal's silhouette")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--per-class-cap", type=int, default=3,
@@ -406,8 +398,7 @@ def main(argv=None):
     canvas, history, placed = compose(
         args.animal, objects, config, rounds=args.rounds,
         blend_mode=args.blend, alpha=args.alpha, output_dir=args.output_dir,
-        threads=args.threads, clip_to_animal=not args.no_clip,
-        allow_repeat_class=args.allow_repeat_class,
+        threads=args.threads, allow_repeat_class=args.allow_repeat_class,
     )
 
     animal_name = os.path.splitext(os.path.basename(args.animal))[0]

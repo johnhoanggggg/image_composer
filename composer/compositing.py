@@ -27,14 +27,11 @@ def _blend_region(target_region, patch_region, mask_region, blend_mode, alpha):
 
 
 def composite(patch, target, x, y, scale, blend_mode="soft", alpha=0.9,
-              patch_mask=None, return_placed_mask=False, clip_mask=None):
+              patch_mask=None, return_placed_mask=False):
     """Paste `patch` onto a copy of `target` at (x, y), scaled by `scale`.
 
     `patch_mask` is a float32 alpha in [0, 1]; without one the patch's
     non-black pixels are used, which is only right for pre-cut images.
-
-    `clip_mask` is a target-sized uint8 stencil the paste is confined to, used
-    to keep objects inside the animal's silhouette.
     """
     result = target.copy()
     ph, pw = patch.shape[:2]
@@ -63,11 +60,6 @@ def composite(patch, target, x, y, scale, blend_mode="soft", alpha=0.9,
 
     patch_region = patch_scaled[py1:py2, px1:px2]
     mask_region = np.clip(validity[py1:py2, px1:px2], 0.0, 1.0)
-
-    if clip_mask is not None:
-        stencil = clip_mask[y1:y2, x1:x2].astype(np.float32) / 255.0
-        mask_region = mask_region * stencil
-
     result[y1:y2, x1:x2] = _blend_region(result[y1:y2, x1:x2], patch_region,
                                          mask_region, blend_mode, alpha)
 

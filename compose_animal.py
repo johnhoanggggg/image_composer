@@ -151,11 +151,12 @@ def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
 
     describe_silhouette(animal_mask, animal_subject)
 
-    # Objects are deliberately not clipped to the subject's silhouette.  Cutting
-    # every paste to the outline underneath makes the canvas act as a stencil,
-    # and the result is too tidy: the overhang where an object runs past the
-    # edge it was matched to is the point.  Containment still steers placements
-    # onto the subject as a scoring term, it just no longer enforces them.
+    # Objects are never trimmed to the subject's silhouette -- cutting each
+    # paste to the outline underneath makes the canvas a stencil and the result
+    # too tidy.  Where a placement sits is bounded instead, by the containment
+    # gate in the matcher: most of an object's body has to land on the subject,
+    # so objects fill the outline rather than hanging off it, and the fraction
+    # allowed outside is the ragged edge.
 
     occupied_full = np.zeros(canvas.shape[:2], np.uint8)
     history = [canvas.copy()]
@@ -191,6 +192,7 @@ def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
                                overlap_penalty=config["overlap_penalty"],
                                min_body_frac=config["min_body_frac"],
                                max_overlap=config["max_overlap"],
+                               min_containment=config["min_containment"],
                                rank_only=rank_only)
             return None if r is None else (r, idx)
 
@@ -333,6 +335,9 @@ def parse_args(argv):
     p.add_argument("--rank-top-k", type=int, default=15,
                    help="objects promoted from the coarse ranking pass to "
                         "full-resolution matching each round")
+    p.add_argument("--min-containment", type=float, default=0.85,
+                   help="fraction of each object that must land inside the "
+                        "subject's outline; the remainder is the overhang")
     p.add_argument("--max-overlap", type=float, default=0.35,
                    help="reject a placement burying more than this fraction of "
                         "itself in already-placed objects")
@@ -365,6 +370,7 @@ def main(argv=None):
         "min_body_frac": args.min_body_frac,
         "min_score": args.min_score,
         "max_overlap": args.max_overlap,
+        "min_containment": args.min_containment,
         "rank_top_k": args.rank_top_k,
         "rank_coarse_factor": 6,
         "rank_scale_steps": 8,

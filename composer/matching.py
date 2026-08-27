@@ -106,7 +106,7 @@ def _edge_distance(edge_binary):
 
 def _score_at_scale(ctx, patch_outline, patch_body, scale, patch_dist=None,
                     overlap_penalty=0.0, min_body_frac=0.0, tau=6.0,
-                    max_overlap=1.0):
+                    max_overlap=1.0, min_containment=0.0):
     """Dense score map for one scale. Returns (best_score, x, y) or None."""
     ph, pw = patch_outline.shape[:2]
     th, tw = ctx.shape
@@ -165,6 +165,16 @@ def _score_at_scale(ctx, patch_outline, patch_body, scale, patch_dist=None,
         inside = cv2.matchTemplate(ctx.subject, body_t, cv2.TM_CCORR) / n_body
         score = score + W_CONTAIN * inside
 
+        if min_containment > 0:
+            # Objects belong inside the subject's outline, not hanging off it
+            # into the background.  As a scoring term alone, containment loses
+            # to a strong edge match and the object ends up half in the sky, so
+            # it is a gate: at least this fraction of the object's body must
+            # land on the subject.  It bounds where a placement sits without
+            # trimming the object, which is what keeps the edges ragged --
+            # the leftover fraction is exactly the overhang that shows.
+            score = np.where(inside < min_containment, -np.inf, score)
+
         if ctx.occupied.any():
             covered = cv2.matchTemplate(ctx.occupied, body_t, cv2.TM_CCORR) / n_body
             if overlap_penalty > 0:
@@ -188,7 +198,8 @@ def _score_at_scale(ctx, patch_outline, patch_body, scale, patch_dist=None,
 def match_outline(ctx, patch_outline, patch_body, min_scale=0.3, max_scale=0.8,
                   scale_steps=20, max_resolution=320, coarse_factor=3,
                   refine_top=3, overlap_penalty=0.0, min_body_frac=0.0,
-                  tau=6.0, max_overlap=1.0, rank_only=False):
+                  tau=6.0, max_overlap=1.0, rank_only=False,
+                  min_containment=0.0):
     """Coarse-to-fine scale sweep. Returns dict or None.
 
     Scales are expressed as a fraction of `max_resolution`, so min_scale=0.3
@@ -225,7 +236,8 @@ def match_outline(ctx, patch_outline, patch_body, min_scale=0.3, max_scale=0.8,
         for s in scales:
             r = _score_at_scale(small_ctx, small_outline, small_body, s,
                                 small_dist, overlap_penalty, min_body_frac,
-                                tau=tau / cf, max_overlap=max_overlap)
+                                tau=tau / cf, max_overlap=max_overlap,
+                                min_containment=min_containment)
             if r is not None:
                 coarse.append((r[0], s, r[1], r[2]))
         if not coarse:
@@ -251,7 +263,8 @@ def match_outline(ctx, patch_outline, patch_body, min_scale=0.3, max_scale=0.8,
     for s in candidate_scales:
         r = _score_at_scale(ctx, patch_outline, patch_body, s, patch_dist,
                             overlap_penalty, min_body_frac, tau=tau,
-                            max_overlap=max_overlap)
+                            max_overlap=max_overlap,
+                            min_containment=min_containment)
         if r is None:
             continue
         if best is None or r[0] > best[0]:
@@ -295,7 +308,8 @@ def _downscale_context(ctx, factor):
 
 
 def match_variants(ctx, variants, config, overlap_penalty=0.0,
-                   min_body_frac=0.0, max_overlap=1.0, rank_only=False):
+                   min_body_frac=0.0, max_overlap=1.0, rank_only=False,
+                   min_containment=0.0):
     """Best placement of any variant of one patch on one target.
 
     With rank_only the search stays at coarse resolution and skips the
@@ -328,6 +342,7 @@ def match_variants(ctx, variants, config, overlap_penalty=0.0,
             overlap_penalty=overlap_penalty,
             min_body_frac=min_body_frac,
             max_overlap=max_overlap,
+            min_containment=min_containment,
         )
         if r is None:
             continue

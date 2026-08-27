@@ -110,7 +110,7 @@ def contact_sheet(entries, path, columns=4, cell=460):
     for ax in axes.flatten():
         ax.axis("off")
 
-    for i, (name, image, placed) in enumerate(entries):
+    for i, (name, image, placed, _hist) in enumerate(entries):
         ax = axes[i // columns][i % columns]
         ax.imshow(image)
         parts = " + ".join(p["class_name"] for p in placed)
@@ -122,6 +122,53 @@ def contact_sheet(entries, path, columns=4, cell=460):
     plt.savefig(path, dpi=125, bbox_inches="tight")
     plt.close(fig)
     print(f"Contact sheet: {path}")
+
+
+def step_sheets(entries, path_stem, rows_per_sheet=6):
+    """One row per composition, one column per object as it lands.
+
+    The finished picture hides the order things arrived in; this shows the
+    canvas, then each object added on top of the last, which is the only view
+    that makes a placement's contribution legible.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    written = []
+    chunks = [entries[i:i + rows_per_sheet]
+              for i in range(0, len(entries), rows_per_sheet)]
+
+    for sheet_no, chunk in enumerate(chunks, 1):
+        cols = max(len(h) for _n, _i, _p, h in chunk)
+        rows = len(chunk)
+        fig, axes = plt.subplots(rows, cols, figsize=(2.9 * cols, 3.25 * rows),
+                                 squeeze=False)
+        for ax in axes.flatten():
+            ax.axis("off")
+
+        for r, (name, _img, placed, history) in enumerate(chunk):
+            for c, frame in enumerate(history):
+                ax = axes[r][c]
+                ax.imshow(frame)
+                ax.axis("off")
+                if c == 0:
+                    ax.set_title(f"{name.replace('_', ' ')}\n(original)",
+                                 fontsize=8, weight="bold")
+                else:
+                    p = placed[c - 1]
+                    ax.set_title(f"+ {p['class_name']}\n{p['source']}  "
+                                 f"{p['score']:.2f}", fontsize=8)
+
+        plt.suptitle(f"Each object as it lands — sheet {sheet_no} of {len(chunks)}",
+                     fontsize=14, weight="bold")
+        plt.tight_layout()
+        out = f"{path_stem}_{sheet_no:02d}.png"
+        plt.savefig(out, dpi=118, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Step sheet: {out}")
+        written.append(out)
+    return written
 
 
 def parse_args(argv):
@@ -143,12 +190,15 @@ def parse_args(argv):
     p.add_argument("--rotation-steps", type=int, default=8)
     p.add_argument("--min-body-frac", type=float, default=0.10)
     p.add_argument("--max-overlap", type=float, default=0.35)
+    p.add_argument("--min-containment", type=float, default=0.85)
     p.add_argument("--overlap-penalty", type=float, default=0.35)
     p.add_argument("--min-score", type=float, default=0.22)
     p.add_argument("--rank-top-k", type=int, default=15)
     p.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--columns", type=int, default=4)
+    p.add_argument("--rows-per-sheet", type=int, default=6,
+                   help="compositions per step sheet")
     return p.parse_args(argv)
 
 
@@ -167,6 +217,7 @@ def main(argv=None):
         "min_body_frac": args.min_body_frac,
         "min_score": args.min_score,
         "max_overlap": args.max_overlap,
+        "min_containment": args.min_containment,
         "rank_top_k": args.rank_top_k,
         "coarse_factor": 3, "refine_top": 3,
         "rank_coarse_factor": 6, "rank_scale_steps": 8,
@@ -209,7 +260,7 @@ def main(argv=None):
         name = name.replace(os.sep, "_").replace(" ", "_")
         print(f"\n{'#' * 60}\n# [{i}/{len(canvases)}] {label}\n{'#' * 60}")
         try:
-            image, _history, placed = compose(
+            image, history, placed = compose(
                 path, objects, config, rounds=args.rounds,
                 output_dir=args.output_dir, save_steps=False,
                 threads=args.threads, variant_cache=variants, name=name)
@@ -217,7 +268,7 @@ def main(argv=None):
             print(f"  ! failed: {type(exc).__name__}: {exc}")
             continue
         if placed:
-            entries.append((label, image, placed))
+            entries.append((label, image, placed, history))
             manifest.append({
                 "name": name,
                 "label": label,
@@ -235,9 +286,11 @@ def main(argv=None):
 
     contact_sheet(entries, os.path.join(args.output_dir, "contact_sheet.png"),
                   columns=args.columns)
+    step_sheets(entries, os.path.join(args.output_dir, "steps"),
+                rows_per_sheet=args.rows_per_sheet)
 
     print(f"\n{len(entries)} compositions in {args.output_dir}/")
-    for name, _img, placed in entries:
+    for name, _img, placed, _hist in entries:
         parts = ", ".join(f"{p['class_name']} ({p['score']:.2f})" for p in placed)
         print(f"  {name:<20} {parts}")
     return 0

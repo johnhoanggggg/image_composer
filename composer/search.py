@@ -92,6 +92,7 @@ def search(patches, targets, config, top_k=25, num_threads=4,
 
         cfg = dict(config)
         cfg["patch_scale"] = patch["img_scale"]
+        cfg.setdefault("min_containment", 0.0)
         results = match_targets(targets, variants, cfg, num_threads=num_threads)
 
         results.sort(key=lambda r: r["score"], reverse=True)

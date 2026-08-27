@@ -92,9 +92,9 @@ class TargetContext:
         self.occupied = occupied
         self.occupied_integral = cv2.integral(occupied)
         for factor, small in self._small.items():
-            small.occupied = cv2.resize(
+            small.occupied = (cv2.resize(
                 occupied, (small.shape[1], small.shape[0]),
-                interpolation=cv2.INTER_NEAREST)
+                interpolation=cv2.INTER_AREA) > 0.5).astype(np.float32)
             small.occupied_integral = cv2.integral(small.occupied)
 
 
@@ -295,12 +295,19 @@ def _downscale_context(ctx, factor):
     small.edge_count = float(np.count_nonzero(small.outline))
     small.edges_f = (small.outline > 0).astype(np.float32)
     small.edge_integral = cv2.integral(small.edges_f)
-    small.subject = cv2.resize(ctx.subject, (small.shape[1], small.shape[0]),
-                               interpolation=cv2.INTER_AREA)
+    # Re-binarise after downsampling.  subject and occupied are 0/1 masks, and
+    # INTER_AREA turns their edges into a fractional ramp -- 37% of the non-zero
+    # pixels at factor 6.  Fractions there make the containment and overlap
+    # ratios mean something different at each resolution, and a placement that
+    # clears the gates at full res gets rejected during ranking.
+    small.subject = (cv2.resize(ctx.subject, (small.shape[1], small.shape[0]),
+                                interpolation=cv2.INTER_AREA)
+                     > 0.5).astype(np.float32)
     small.subject_integral = cv2.integral(small.subject)
     small.subject_area = float(small.subject.sum())
-    small.occupied = cv2.resize(ctx.occupied, (small.shape[1], small.shape[0]),
-                                interpolation=cv2.INTER_AREA)
+    small.occupied = (cv2.resize(ctx.occupied, (small.shape[1], small.shape[0]),
+                                 interpolation=cv2.INTER_AREA)
+                      > 0.5).astype(np.float32)
     small.occupied_integral = cv2.integral(small.occupied)
     small._small = {}
     ctx._small[factor] = small
@@ -328,6 +335,16 @@ def match_variants(ctx, variants, config, overlap_penalty=0.0,
         # promoted objects are then matched over every orientation.
         stride = max(1, int(config.get("rank_rotation_stride", 2)))
         variants = variants[::stride]
+
+        # Gate loosely here.  A mask reduced 6x cannot resolve these ratios
+        # exactly, and the cascade only ever refines what ranking shortlists,
+        # so a strict gate at this stage throws away placements that would have
+        # passed at full resolution -- and the round then reports that nothing
+        # fits at all.  Full resolution applies the real gates.
+        slack = float(config.get("rank_gate_slack", 0.75))
+        min_containment = min_containment * slack
+        max_overlap = min(1.0, max_overlap + (1.0 - slack))
+        min_body_frac = min_body_frac * slack
 
     best = None
     for patch_img, outline, body, transform in variants:

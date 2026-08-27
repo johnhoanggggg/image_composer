@@ -36,6 +36,22 @@ Useful flags:
 | `--no-clip` | let objects spill outside the animal's silhouette |
 | `--rank-top-k N` | objects promoted from coarse ranking to full-resolution matching |
 
+## Many images at once
+
+`make_gallery.py` composes a batch against one shared object pool. Loading and
+segmenting the pool is the slow half of a run, so doing it once instead of once
+per image makes each extra picture cost only its own rounds.
+
+```bash
+python make_gallery.py --count 12 --rounds 4 --num-objects 900
+python make_gallery.py --canvas a.jpg --canvas b.jpg --rounds 3
+```
+
+With no `--canvas` it picks canvases from Caltech101 by silhouette quality —
+subject fills a reasonable part of the frame, is the only thing in it, and has
+an outline with some structure — so the batch is not full of images the
+segmenter could not cut. It writes each composition plus a contact sheet.
+
 ## Search the other direction
 
 `search_targets.py` takes patches from a folder and finds dataset images they
@@ -61,11 +77,19 @@ into an unusable blob. Archives download once into
 | `caltech101` | 9k photos, 101 object categories — best all-round source | 126 MB |
 | `flowers102` | 8k single flowers, very clean separation | 329 MB |
 | `imagenette` | 13k photos, 10 easily-separable ImageNet classes | 326 MB |
+| `imagewoof` | 13k dog photos across 10 breeds | 328 MB |
+| `figures` | 1k rendered humans and horses on plain white | 142 MB |
+| `hands` | 2.5k rendered hands on plain white | 191 MB |
 | `pets` | 7k cat and dog portraits | 774 MB |
 | `birds` | 12k birds (CUB-200) | 1.1 GB |
 | `cars` | 16k cars, strong silhouettes | 1.9 GB |
 | `imagenet` | ImageNet-1k streamed from HuggingFace | — |
 | `folder` | any local directory, via `--folder` | — |
+
+`figures` and `hands` are rendered on flat white, so they cut perfectly and
+contribute articulated and long thin silhouettes that the photo sets mostly
+lack. Pool *size* matters as much as variety — the matcher takes the best fit
+it can find, so more candidates means closer fits.
 
 `imagenet` needs network access to `huggingface.co`; the rest come from S3
 mirrors. Unreachable sources are skipped with a warning rather than aborting
@@ -104,5 +128,6 @@ composer/
   search.py       the patch-to-target direction
   cache.py        on-disk mask cache
 compose_animal.py   build an animal out of objects
+make_gallery.py     compose a batch against one shared pool
 search_targets.py   find images a patch composites onto
 ```

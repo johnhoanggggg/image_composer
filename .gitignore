@@ -4,3 +4,4 @@ __pycache__/
 output/
 search_output/
 saved_*.png
+gallery/

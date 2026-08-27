@@ -14,14 +14,24 @@ into an unusable blob.
   cars         16k cars, single subject, strong silhouette.
   birds        12k birds (CUB-200), single subject.
   imagenette   13k photos across 10 easily-separable ImageNet classes.
+  imagewoof    13k dog photos across 10 breeds.
+  figures      1k rendered human and horse figures on plain white -- the
+               easiest silhouettes available, and unusually articulated ones.
+  hands        2.5k rendered hands on plain white; long thin shapes that little
+               else in the pool provides.
   imagenet     ImageNet-1k streamed from HuggingFace (needs network access to
                huggingface.co; not reachable from every sandbox).
   folder       Any local directory of images.
+
+Pool size matters as much as pool variety: the matcher takes the best fit it
+can find, so more candidates means closer fits.
 """
 
 import os
 import random
+import shutil
 import tarfile
+import zipfile
 
 import cv2
 import numpy as np
@@ -31,15 +41,19 @@ from .cache import DATASET_DIR
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
 FASTAI_BASE = "https://s3.amazonaws.com/fast-ai-imageclas"
+TFDATA_BASE = "https://storage.googleapis.com/download.tensorflow.org/data"
 
-# name -> (archive, directory that appears after extraction, approx MB)
+# name -> (url, directory that appears after extraction, approx MB)
 ARCHIVE_SOURCES = {
-    "caltech101": ("caltech_101.tgz", "101_ObjectCategories", 126),
-    "flowers102": ("oxford-102-flowers.tgz", "oxford-102-flowers", 329),
-    "pets": ("oxford-iiit-pet.tgz", "oxford-iiit-pet", 774),
-    "cars": ("stanford-cars.tgz", "stanford-cars", 1867),
-    "birds": ("CUB_200_2011.tgz", "CUB_200_2011", 1097),
-    "imagenette": ("imagenette2-320.tgz", "imagenette2-320", 326),
+    "caltech101": (f"{FASTAI_BASE}/caltech_101.tgz", "101_ObjectCategories", 126),
+    "flowers102": (f"{FASTAI_BASE}/oxford-102-flowers.tgz", "oxford-102-flowers", 329),
+    "pets": (f"{FASTAI_BASE}/oxford-iiit-pet.tgz", "oxford-iiit-pet", 774),
+    "cars": (f"{FASTAI_BASE}/stanford-cars.tgz", "stanford-cars", 1867),
+    "birds": (f"{FASTAI_BASE}/CUB_200_2011.tgz", "CUB_200_2011", 1097),
+    "imagenette": (f"{FASTAI_BASE}/imagenette2-320.tgz", "imagenette2-320", 326),
+    "imagewoof": (f"{FASTAI_BASE}/imagewoof2-320.tgz", "imagewoof2-320", 328),
+    "figures": (f"{TFDATA_BASE}/horse-or-human.zip", "horse-or-human", 142),
+    "hands": (f"{TFDATA_BASE}/rps.zip", "rps", 191),
 }
 
 # Caltech101 categories that are background clutter or too texture-like to
@@ -65,6 +79,10 @@ WORDNET_NAMES = {
 # a name from.
 FLAT_SOURCES = {"flowers102": "flower", "cars": "car"}
 
+# Sources that are flat but encode the class in the filename, e.g. the Oxford
+# pets set's "great_pyrenees_133.jpg".
+FILENAME_LABEL_SOURCES = {"pets"}
+
 
 def _download(url, dest):
     import urllib.request
@@ -86,25 +104,62 @@ def _download(url, dest):
     print()
 
 
-def ensure_archive(name):
-    """Download and extract an archive source, returning its root directory."""
+def ensure_archive(name, keep_archive=False):
+    """Download and extract an archive source, returning its root directory.
+
+    The extracted tree is the cache, so the archive is removed once it has been
+    unpacked -- keeping both roughly doubles the disk this needs, and several of
+    these sets run to a couple of gigabytes.
+    """
     if name not in ARCHIVE_SOURCES:
         raise ValueError(f"Unknown archive source: {name}")
-    archive, dirname, size_mb = ARCHIVE_SOURCES[name]
+    url, dirname, size_mb = ARCHIVE_SOURCES[name]
     os.makedirs(DATASET_DIR, exist_ok=True)
     root = os.path.join(DATASET_DIR, dirname)
     if os.path.isdir(root):
         return root
 
+    archive = os.path.basename(url)
     archive_path = os.path.join(DATASET_DIR, archive)
     if not os.path.exists(archive_path):
         print(f"Fetching '{name}' (~{size_mb} MB, one time)")
-        _download(f"{FASTAI_BASE}/{archive}", archive_path)
+        _download(url, archive_path)
 
     print(f"  extracting {archive} ...")
-    with tarfile.open(archive_path) as tf:
-        tf.extractall(DATASET_DIR)
+    # Some of these archives unpack loose into the current directory rather
+    # than into a folder of their own, so extract into a staging directory and
+    # move the result into place.
+    staging = os.path.join(DATASET_DIR, f".{dirname}.staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+    if archive.endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(staging)
+    else:
+        with tarfile.open(archive_path) as tf:
+            tf.extractall(staging)
+
+    entries = os.listdir(staging)
+    if len(entries) == 1 and os.path.isdir(os.path.join(staging, entries[0])):
+        shutil.move(os.path.join(staging, entries[0]), root)
+        shutil.rmtree(staging, ignore_errors=True)
+    else:
+        shutil.move(staging, root)
+
+    if not keep_archive:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
     return root
+
+
+# Directories inside a source that hold annotations, not photographs.
+SKIP_DIRS = {
+    "caltech101": set(CALTECH_SKIP),
+    "birds": {"parts", "attributes", "segmentations"},
+    "pets": {"annotations"},
+}
 
 
 def _list_images(root, skip_dirs=()):
@@ -130,6 +185,14 @@ def _class_name_from_path(path, root, source=None):
     if source in FLAT_SOURCES:
         return FLAT_SOURCES[source]
 
+    if source in FILENAME_LABEL_SOURCES:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        # "great_pyrenees_133" -> "great pyrenees"
+        parts = stem.split("_")
+        if len(parts) > 1 and parts[-1].isdigit():
+            parts = parts[:-1]
+        return " ".join(parts).lower()
+
     rel = os.path.relpath(path, root)
     parts = rel.split(os.sep)
     if len(parts) >= 2:
@@ -145,8 +208,7 @@ def _class_name_from_path(path, root, source=None):
 
 def load_archive_source(name, num_images, rng, per_class_cap=None):
     root = ensure_archive(name)
-    skip = CALTECH_SKIP if name == "caltech101" else ()
-    files = _list_images(root, skip_dirs=skip)
+    files = _list_images(root, skip_dirs=SKIP_DIRS.get(name, ()))
     if not files:
         return []
 
@@ -155,14 +217,21 @@ def load_archive_source(name, num_images, rng, per_class_cap=None):
     # A flat source has one class name for every image, so capping per class
     # would admit exactly one image from it.
     if per_class_cap and name not in FLAT_SOURCES:
-        counts = {}
-        kept = []
+        by_class = {}
         for f in files:
-            cls = _class_name_from_path(f, root, name)
-            if counts.get(cls, 0) >= per_class_cap:
-                continue
-            counts[cls] = counts.get(cls, 0) + 1
-            kept.append(f)
+            by_class.setdefault(_class_name_from_path(f, root, name), []).append(f)
+
+        # Raise the cap when a source has too few categories to fill its share.
+        # A fixed cap of 3 lets a 200-category set contribute 600 images but a
+        # 3-category set only 9, quietly starving exactly the sources whose
+        # silhouettes are cleanest.
+        needed = int(np.ceil(num_images / max(1, len(by_class))))
+        cap = max(per_class_cap, needed)
+
+        kept = []
+        for members in by_class.values():
+            kept.extend(members[:cap])
+        rng.shuffle(kept)
         files = kept
 
     out = []

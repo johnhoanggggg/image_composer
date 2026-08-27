@@ -126,7 +126,8 @@ def place_object(canvas, obj, result, blend_mode, alpha, clip_mask=None):
 
 def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
             alpha=1.0, output_dir="output", save_steps=True, threads=4,
-            clip_to_animal=True, allow_repeat_class=False):
+            clip_to_animal=True, allow_repeat_class=False,
+            variant_cache=None):
     """Layer `rounds` objects onto the animal, best fit first."""
     animal_bgr = cv2.imread(animal_path, cv2.IMREAD_COLOR)
     if animal_bgr is None:
@@ -161,11 +162,14 @@ def compose(animal_path, objects, config, rounds=4, blend_mode="alpha",
     history = [canvas.copy()]
     placed = []
 
-    print(f"\nPrecomputing variants for {len(objects)} objects...")
-    variant_cache = [build_variants(o, config) for o in objects]
-    n_variants = sum(len(v) for v in variant_cache)
-    print(f"  {n_variants} variants total "
-          f"({n_variants / max(1, len(objects)):.0f} per object)")
+    # Variants depend only on the object pool, so a caller composing several
+    # canvases against the same pool can build them once and pass them in.
+    if variant_cache is None:
+        print(f"\nPrecomputing variants for {len(objects)} objects...")
+        variant_cache = [build_variants(o, config) for o in objects]
+        n_variants = sum(len(v) for v in variant_cache)
+        print(f"  {n_variants} variants total "
+              f"({n_variants / max(1, len(objects)):.0f} per object)")
 
     used = set()
     used_classes = set()

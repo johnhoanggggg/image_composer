@@ -124,6 +124,18 @@ def contact_sheet(entries, path, columns=4, cell=460):
     print(f"Contact sheet: {path}")
 
 
+def write_steps(history, output_dir, name):
+    """Save each round's frame, so the build order survives the run."""
+    steps_dir = os.path.join(output_dir, "steps")
+    os.makedirs(steps_dir, exist_ok=True)
+    paths = []
+    for i, frame in enumerate(history):
+        path = os.path.join(steps_dir, f"{name}_{i:02d}.png")
+        cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        paths.append(path)
+    return paths
+
+
 def step_sheets(entries, path_stem, rows_per_sheet=6):
     """One row per composition, one column per object as it lands.
 
@@ -264,6 +276,7 @@ def main(argv=None):
                 path, objects, config, rounds=args.rounds,
                 output_dir=args.output_dir, save_steps=False,
                 threads=args.threads, variant_cache=variants, name=name)
+            step_paths = write_steps(history, args.output_dir, name)
         except Exception as exc:
             print(f"  ! failed: {type(exc).__name__}: {exc}")
             continue
@@ -274,6 +287,7 @@ def main(argv=None):
                 "label": label,
                 "canvas": os.path.abspath(path),
                 "composed": os.path.join(args.output_dir, f"{name}_composed.png"),
+                "steps": step_paths,
                 "placed": [{"class_name": p["class_name"], "source": p["source"],
                             "score": round(float(p["score"]), 4)} for p in placed],
             })
@@ -286,7 +300,7 @@ def main(argv=None):
 
     contact_sheet(entries, os.path.join(args.output_dir, "contact_sheet.png"),
                   columns=args.columns)
-    step_sheets(entries, os.path.join(args.output_dir, "steps"),
+    step_sheets(entries, os.path.join(args.output_dir, "step_sheet"),
                 rows_per_sheet=args.rows_per_sheet)
 
     print(f"\n{len(entries)} compositions in {args.output_dir}/")
